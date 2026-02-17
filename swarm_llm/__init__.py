@@ -15,7 +15,7 @@ from swarm_llm.nash_moe import NashMoE, NashRouter
 from swarm_llm.nash_parisi_model import NashParisiLLM
 from swarm_llm.unified import UnifiedParisiNashLLM, UnifiedParisiNashAttention
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "SwarmConfig",

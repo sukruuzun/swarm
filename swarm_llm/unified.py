@@ -1,27 +1,27 @@
 """
-Birleşik Parisi-Nash Dikkat Mekanizması v4
+Birleşik Parisi-Nash Dikkat Mekanizması v5
 ============================================
-İki teoriyi TEK BİR FORMÜLDE birleştiren orijinal mimari.
+Keskin Uzmanlaşma ve Uzun Koşu.
 
-v4 Kritik Düzeltme: Differentiable Routing
-  v3'te router CE loss'tan SIFIR gradyan alıyordu (gradyan körlüğü).
-  v4'te her expert çıktısı router olasılığı ile çarpılır:
-    output = p_k × φ_k(attn_k(x))
-  Bu sayede CE loss → ∂L/∂p_k → ∂L/∂gate → router ÖĞRENIR.
-
-  Forward:  hard expert seçimi (sparse, hızlı)
-  Backward: soft gradyan akışı (straight-through estimator)
+v5 İyileştirmeleri (v4 üzerine):
+  1. MLP Router: Linear → LayerNorm + Linear(384→64) + GELU + Linear(64→4)
+     Daha derin muhakeme, token türüne göre akıllı yönlendirme
+  2. lb_coeff = 0.0001: Mikro denge koruma, agresif uzmanlaşmaya izin
+  3. 7500 step + min LR 5e-5: Uzun koşu, kuyrukta öğrenme devam eder
+  4. Decoupled gradient clipping: Router 0.5, Expert 1.0
+  5. Temperature schedule 7500 step'e uzatılmış
 
 Formül:
   v_i(t+1) = p_k(x_i) · φ_k(Σ_{j∈N(i)} α_ij^k · V_k_j) + η·ε
 
-  p_k = softmax(gate(x_i) / T)[k]  ← differentiable!
-  k = argmax(gate(x_i))             ← hard seçim (forward)
+  p_k = softmax(MLP_router(x_i) / T)[k]  ← MLP differentiable!
+  k = argmax(MLP_router(x_i))             ← hard seçim (forward)
 
-Önceki versiyon sorunları ve çözümleri:
+Evrim:
   v1: Expert collapse        → v2: Load balancing eklendi
   v2: Aşırı denge (T takıldı) → v3: Temperature annealing
   v3: Gradyan körlüğü (%25)  → v4: Differentiable routing
+  v4: Sınırlı uzmanlaşma     → v5: MLP router + düşük LB + uzun koşu
 """
 
 import math
@@ -97,17 +97,17 @@ class ExpertAttentionHead(nn.Module):
         return self.drop(self.w2(F.silu(self.w1(attn_out)) * self.v_gate(attn_out)))
 
 
-# ── Nash Router v4 ───────────────────────────────────────────────────────────
+# ── Nash Router v5 (MLP) ─────────────────────────────────────────────────────
 
 class NashExpertRouter(nn.Module):
     """
-    Nash Dengesi tabanlı expert router v4 -- Differentiable.
+    Nash Dengesi tabanlı expert router v5 -- MLP Differentiable.
 
-    v4 farkı:
-      - Raw softmax olasılıkları döner (normalize ETMİYOR)
-      - Bu olasılıklar expert çıktısıyla çarpılır
-      - CE loss → ∂L/∂p_k → ∂L/∂gate: GRADYAN AKAR
-      - Router artık "hangi expert daha iyi?" sorusuna cevap öğrenir
+    v5 farkı (v4 üzerine):
+      - Linear(384→4) yerine MLP: LayerNorm → Linear(384→64) → GELU → Linear(64→4)
+      - Daha derin muhakeme: token türüne göre akıllı routing
+      - +12K parametre ama routing kalitesini katlıyor
+      - LayerNorm sayesinde katmanlar arası tutarlı routing
     """
 
     def __init__(self, embed_dim: int, num_experts: int, top_k: int = 1):
@@ -115,7 +115,13 @@ class NashExpertRouter(nn.Module):
         self.num_experts = num_experts
         self.top_k = top_k
 
-        self.gate = nn.Linear(embed_dim, num_experts, bias=False)
+        router_hidden = 64
+        self.gate = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, router_hidden, bias=False),
+            nn.GELU(),
+            nn.Linear(router_hidden, num_experts, bias=False),
+        )
 
         self.register_buffer('current_temperature', torch.tensor(2.0))
         self.register_buffer('cumulative_regret', torch.zeros(num_experts))
@@ -163,18 +169,15 @@ class NashExpertRouter(nn.Module):
 
 class UnifiedParisiNashAttention(nn.Module):
     """
-    Birleşik Parisi-Nash v4: Differentiable Routing.
+    Birleşik Parisi-Nash v5: MLP Router + Agresif Uzmanlaşma.
 
     TEK FORMÜL:
     v_i = p_k(x_i) · φ_k(Σ_{j∈N(i)} α_ij^k · V_k_j) + η·ε
 
-    Gradyan akış zinciri:
-      CE Loss → ∂L/∂output → ∂L/∂(p_k · expert_out)
-             → ∂L/∂p_k (router öğrenir!)
-             → ∂L/∂expert_out (expert öğrenir!)
-
-    v3'teki sorun: output = expert_out (p_k yok → router körlüğü)
-    v4 çözümü:    output = p_k × expert_out (p_k var → router öğrenir)
+    v5 farkları:
+      - MLP router ile daha akıllı yönlendirme
+      - Düşük LB (0.0001) ile serbest uzmanlaşma
+      - Decoupled gradient clipping desteği
     """
 
     def __init__(self, config: SwarmConfig):
@@ -295,7 +298,7 @@ class UnifiedParisiNashAttention(nn.Module):
         return output, aux_loss, info
 
 
-# ── Birleşik Blok v4 (Dual Norm) ────────────────────────────────────────────
+# ── Birleşik Blok v5 (Dual Norm) ────────────────────────────────────────────
 
 class UnifiedBlock(nn.Module):
     """İki Normlu Birleşik Parisi-Nash Bloğu."""
@@ -315,17 +318,15 @@ class UnifiedBlock(nn.Module):
         return residual + out, aux_loss, info
 
 
-# ── Birleşik Parisi-Nash Dil Modeli v4 ───────────────────────────────────────
+# ── Birleşik Parisi-Nash Dil Modeli v5 ───────────────────────────────────────
 
 class UnifiedParisiNashLLM(nn.Module):
     """
-    Birleşik Parisi-Nash v4: Differentiable Routing.
+    Birleşik Parisi-Nash v5: Keskin Uzmanlaşma.
 
-    Önceki versiyonların evrimi:
-      v1: Parisi+Nash → collapse (tek expert)
-      v2: +LB loss → aşırı denge (T takıldı)
-      v3: +Annealing+Top1 → gradyan körlüğü (%25 sabit)
-      v4: +Differentiable → router ÖĞRENİR, expert'ler UZMANLAŞIR
+    Evrim:
+      v1: collapse → v2: +LB → v3: +annealing → v4: +differentiable
+      v5: +MLP router + düşük LB + uzun koşu → BASELINE HEDEF
     """
 
     def __init__(self, config: SwarmConfig):
@@ -347,7 +348,7 @@ class UnifiedParisiNashLLM(nn.Module):
 
         self.t_start = 2.0
         self.t_end = 0.3
-        self.lb_coeff = 0.001
+        self.lb_coeff = 0.0001
 
         self.apply(self._init_weights)
 
@@ -435,6 +436,14 @@ class UnifiedParisiNashLLM(nn.Module):
             'expert_FFN/φ (SwiGLU)': expert_ffn,
             'router (Nash)': router_params,
         }
+
+    def get_router_params(self) -> list:
+        """Decoupled gradient clipping için router parametrelerini döner."""
+        return [p for n, p in self.named_parameters() if 'router' in n]
+
+    def get_expert_params(self) -> list:
+        """Decoupled gradient clipping için expert parametrelerini döner."""
+        return [p for n, p in self.named_parameters() if 'router' not in n]
 
     def get_nash_stats(self) -> dict:
         stats = {

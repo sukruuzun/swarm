@@ -1,28 +1,27 @@
 """
-Birleşik Parisi-Nash Dikkat Mekanizması v3
+Birleşik Parisi-Nash Dikkat Mekanizması v4
 ============================================
 İki teoriyi TEK BİR FORMÜLDE birleştiren orijinal mimari.
 
-v3 İyileştirmeleri (v2 üzerine):
-  1. Temperature Annealing: Parisi tavlama ilkesi (2.0 → 0.3)
-     Başlangıçta keşif, sonunda hedefe kilitlenme
-  2. LB katsayısı 0.001: Uzmanlaşmayı engellemeden dengesizliği önle
-  3. Top-K=1: Her token TEK bir expert'e bağlı → zorunlu uzmanlaşma
-  4. Sparse execution: Sadece seçilen expert çalışır → 4x hız kazancı
+v4 Kritik Düzeltme: Differentiable Routing
+  v3'te router CE loss'tan SIFIR gradyan alıyordu (gradyan körlüğü).
+  v4'te her expert çıktısı router olasılığı ile çarpılır:
+    output = p_k × φ_k(attn_k(x))
+  Bu sayede CE loss → ∂L/∂p_k → ∂L/∂gate → router ÖĞRENIR.
+
+  Forward:  hard expert seçimi (sparse, hızlı)
+  Backward: soft gradyan akışı (straight-through estimator)
 
 Formül:
-  v_i(t+1) = w_k^nash(x_i) · φ_k(Σ_{j∈N(i)} α_ij^k · V_k_j) + η·ε
+  v_i(t+1) = p_k(x_i) · φ_k(Σ_{j∈N(i)} α_ij^k · V_k_j) + η·ε
 
-  top_k=1 ile artık toplam (Σ_k) yok -- TEK expert sorumlu.
-  Her expert:
-    - NEREYE bakacağını kendisi belirler (Q_k, K_k)
-    - NEYİ çıkaracağını kendisi belirler (V_k)
-    - NASIL işleyeceğini kendisi belirler (φ_k)
+  p_k = softmax(gate(x_i) / T)[k]  ← differentiable!
+  k = argmax(gate(x_i))             ← hard seçim (forward)
 
-  Parisi fizik kuralları tüm expert'ler için aynı:
-    - Sliding window maskesi (7 komşu kuralı)
-    - Reynolds kuralları (ayrılma/hizalanma/uyum)
-    - Temperature Annealing (tavlama -- Parisi'nin kendi ilkesi)
+Önceki versiyon sorunları ve çözümleri:
+  v1: Expert collapse        → v2: Load balancing eklendi
+  v2: Aşırı denge (T takıldı) → v3: Temperature annealing
+  v3: Gradyan körlüğü (%25)  → v4: Differentiable routing
 """
 
 import math
@@ -57,11 +56,7 @@ def _build_sliding_window_mask(
 class ExpertAttentionHead(nn.Module):
     """
     Tam donanımlı Expert-Attention birimi.
-
-    Her expert kendi Q_k, K_k, V_k projeksiyonlarına sahip:
-      - Q_k·K_k: Bu expert NEREYE bakacak (dikkat deseni)
-      - V_k: Bu expert NEYİ çıkaracak (değer projeksiyonu)
-      - φ_k: Bu expert NASIL işleyecek (SwiGLU dönüşümü)
+    Her expert kendi Q_k, K_k, V_k, φ_k'sine sahip.
     """
 
     def __init__(self, embed_dim: int, num_heads: int, head_dim: int,
@@ -82,7 +77,7 @@ class ExpertAttentionHead(nn.Module):
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor,
                 reynolds_fn, attn_dropout: nn.Dropout) -> torch.Tensor:
-        """Expert-spesifik dikkat + dönüşüm. (B, L, D) → (B, L, D)"""
+        """Expert-spesifik dikkat + SwiGLU. (B, L, D) → (B, L, D)"""
         B, L, D = x.shape
 
         q = self.q_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
@@ -102,19 +97,17 @@ class ExpertAttentionHead(nn.Module):
         return self.drop(self.w2(F.silu(self.w1(attn_out)) * self.v_gate(attn_out)))
 
 
-# ── Nash Router v3 ───────────────────────────────────────────────────────────
+# ── Nash Router v4 ───────────────────────────────────────────────────────────
 
 class NashExpertRouter(nn.Module):
     """
-    Nash Dengesi tabanlı expert router v3.
+    Nash Dengesi tabanlı expert router v4 -- Differentiable.
 
-    v3 İyileştirmeleri:
-      1. Temperature Annealing (Parisi tavlama): T dışarıdan schedule ile kontrol
-         - Öğrenilebilir T kaldırıldı (v2'de takılıyordu)
-         - Cosine schedule: T_start → T_end
-      2. Top-K=1 desteği (varsayılan): zorunlu uzmanlaşma
-      3. LB loss hafifletildi (katsayı 0.001)
-      4. Regret sadece izleme amaçlı (logit'leri değiştirmez)
+    v4 farkı:
+      - Raw softmax olasılıkları döner (normalize ETMİYOR)
+      - Bu olasılıklar expert çıktısıyla çarpılır
+      - CE loss → ∂L/∂p_k → ∂L/∂gate: GRADYAN AKAR
+      - Router artık "hangi expert daha iyi?" sorusuna cevap öğrenir
     """
 
     def __init__(self, embed_dim: int, num_experts: int, top_k: int = 1):
@@ -124,33 +117,28 @@ class NashExpertRouter(nn.Module):
 
         self.gate = nn.Linear(embed_dim, num_experts, bias=False)
 
-        # Temperature artık dışarıdan kontrol edilir (annealing)
         self.register_buffer('current_temperature', torch.tensor(2.0))
-
-        # Regret sadece izleme (logit'leri ETKİLEMEZ)
         self.register_buffer('cumulative_regret', torch.zeros(num_experts))
         self.register_buffer('expert_usage', torch.zeros(num_experts))
         self.register_buffer('step_count', torch.tensor(0, dtype=torch.long))
 
     def set_temperature(self, t: float):
-        """Dışarıdan temperature ayarla (annealing schedule)."""
         self.current_temperature.fill_(t)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns:
-            weights: (B, L, top_k) expert ağırlıkları
-            indices: (B, L, top_k) expert indeksleri
-            aux_loss: Load balancing auxiliary loss
+            raw_probs: (B, L, E) tam softmax olasılıkları (differentiable!)
+            indices:   (B, L, top_k) seçilen expert indeksleri
+            aux_loss:  Load balancing loss
+            probs:     (B, L, E) -- gradyan hesabı için
         """
         T = self.current_temperature.clamp(min=0.1)
         logits = self.gate(x) / T
+        probs = F.softmax(logits, dim=-1)  # (B, L, E) -- differentiable
 
-        probs = F.softmax(logits, dim=-1)
-
-        # Top-K seçimi
-        weights, indices = torch.topk(probs, self.top_k, dim=-1)
-        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-8)
+        # Hard seçim (forward için)
+        _, indices = torch.topk(probs, self.top_k, dim=-1)  # (B, L, top_k)
 
         # ── Load Balancing Loss ──
         with torch.no_grad():
@@ -160,7 +148,7 @@ class NashExpertRouter(nn.Module):
         P = probs.mean(dim=(0, 1))
         aux_loss = self.num_experts * (f * P).sum()
 
-        # İzleme (regret + usage)
+        # İzleme
         if self.training:
             self.step_count += 1
             with torch.no_grad():
@@ -168,23 +156,25 @@ class NashExpertRouter(nn.Module):
                 uniform = torch.ones_like(f) / self.num_experts
                 self.cumulative_regret = 0.99 * self.cumulative_regret + (uniform - f)
 
-        return weights, indices, aux_loss
+        return probs, indices, aux_loss, probs
 
 
-# ── Birleşik Parisi-Nash Dikkat v3 ───────────────────────────────────────────
+# ── Birleşik Parisi-Nash Dikkat v4 ───────────────────────────────────────────
 
 class UnifiedParisiNashAttention(nn.Module):
     """
-    Birleşik Parisi-Nash Dikkat Mekanizması v3.
+    Birleşik Parisi-Nash v4: Differentiable Routing.
 
-    TEK FORMÜL (top_k=1):
-    v_i = φ_k(Σ_{j∈N(i)} α_ij^k · V_k_j) + η·ε
+    TEK FORMÜL:
+    v_i = p_k(x_i) · φ_k(Σ_{j∈N(i)} α_ij^k · V_k_j) + η·ε
 
-    k = argmax Nash router  (tek expert sorumlu)
+    Gradyan akış zinciri:
+      CE Loss → ∂L/∂output → ∂L/∂(p_k · expert_out)
+             → ∂L/∂p_k (router öğrenir!)
+             → ∂L/∂expert_out (expert öğrenir!)
 
-    v3 farkı: SPARSE execution
-      Tüm expert'leri çalıştırıp gather yapmak yerine,
-      sadece SEÇİLEN expert'leri çalıştırır → 4x hız.
+    v3'teki sorun: output = expert_out (p_k yok → router körlüğü)
+    v4 çözümü:    output = p_k × expert_out (p_k var → router öğrenir)
     """
 
     def __init__(self, config: SwarmConfig):
@@ -195,7 +185,6 @@ class UnifiedParisiNashAttention(nn.Module):
         self.top_k = config.top_k_experts
         self.neighbor_size = config.neighbor_size
 
-        # ── Expert Attention Heads ──
         expand_dim = config.embed_dim * config.ffn_multiplier
         self.expert_heads = nn.ModuleList([
             ExpertAttentionHead(
@@ -205,18 +194,13 @@ class UnifiedParisiNashAttention(nn.Module):
             for _ in range(config.num_experts)
         ])
 
-        # ── Çıktı projeksiyonu ──
         self.out_proj = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
-
-        # ── Nash Router v3 ──
         self.router = NashExpertRouter(config.embed_dim, config.num_experts, config.top_k_experts)
 
-        # ── Reynolds Kuralları ──
         self.separation_gate = nn.Parameter(torch.tensor(config.separation_weight))
         self.alignment_gate = nn.Parameter(torch.tensor(config.alignment_weight))
         self.cohesion_gate = nn.Parameter(torch.tensor(config.cohesion_weight))
 
-        # ── Parisi Gürültü (η) ──
         self.noise_eta = nn.Parameter(torch.full((config.embed_dim,), config.noise_strength))
         self.noise_gate = nn.Sequential(
             nn.Linear(config.embed_dim, config.embed_dim),
@@ -254,51 +238,41 @@ class UnifiedParisiNashAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict]:
         """
-        Birleşik Parisi-Nash v3 ileri geçiş.
+        Differentiable Routing ileri geçiş.
 
-        SPARSE execution:
-          1. Nash router → her token için 1 expert seç
-          2. Token'ları expert'lerine göre grupla
-          3. Her expert SADECE kendi token'larını işler
-          4. Sonuçları birleştir + Parisi gürültü
+        1. Router → probs (differentiable) + indices (hard seçim)
+        2. Tüm expert'leri hesapla (hepsinin çıktısı gerekli)
+        3. output = Σ_k p_k × expert_k_output  (differentiable birleştirme)
+           - Forward'da: sadece seçilen expert'in p_k'si anlamlı (diğerleri ~0)
+           - Backward'da: gradyan p_k üzerinden router'a akar
 
         Returns:
-            output: (B, L, D)
-            aux_loss: Load balancing loss
-            info: Nash routing istatistikleri
+            output, aux_loss, info
         """
         B, L, D = x.shape
         mask = self._get_mask(L, x.device)
 
-        # ── Nash routing (top_k=1) ──
-        nash_weights, nash_indices, aux_loss = self.router(x)
-        # nash_weights: (B, L, 1), nash_indices: (B, L, 1)
+        # ── Router: differentiable olasılıklar + hard seçim ──
+        probs, indices, aux_loss, _ = self.router(x)
+        # probs: (B, L, E) -- differentiable softmax
+        # indices: (B, L, top_k) -- hard argmax
 
-        # ── SPARSE expert execution ──
-        # Her expert sadece kendisine atanan token'ları işler
-        output = torch.zeros(B, L, D, device=x.device, dtype=x.dtype)
-        flat_indices = nash_indices.squeeze(-1)  # (B, L)
+        # ── Tüm expert çıktılarını hesapla ──
+        expert_outputs = []
+        for expert in self.expert_heads:
+            out = expert(x, mask, self._reynolds_modulate, self.attn_dropout)
+            expert_outputs.append(out)
 
-        for expert_idx, expert in enumerate(self.expert_heads):
-            # Bu expert'e atanan token'lar
-            token_mask = (flat_indices == expert_idx)  # (B, L) bool
+        # Stack: (B, L, E, D)
+        stacked = torch.stack(expert_outputs, dim=2)
 
-            if not token_mask.any():
-                continue
-
-            # Expert'in çıktısını hesapla (tüm pozisyonlar -- mask zaten attention'da)
-            expert_out = expert(x, mask, self._reynolds_modulate, self.attn_dropout)
-
-            # Sadece bu expert'e atanan pozisyonlara yaz
-            if self.top_k == 1:
-                output[token_mask] = expert_out[token_mask]
-            else:
-                # top_k > 1 durumunda ağırlıklı toplam
-                weight_for_expert = torch.zeros(B, L, device=x.device)
-                for k in range(self.top_k):
-                    k_mask = (nash_indices[:, :, k] == expert_idx)
-                    weight_for_expert[k_mask] = nash_weights[:, :, k][k_mask]
-                output = output + weight_for_expert.unsqueeze(-1) * expert_out
+        # ── Differentiable routing: p_k × expert_k ──
+        # probs: (B, L, E) → (B, L, E, 1) ile çarp
+        # Bu, tüm expert çıktılarını olasılıklarıyla ağırlıklar
+        # Düşük T'de probs keskin → neredeyse tek expert aktif
+        # AMA gradyan hep akar (softmax differentiable)
+        weighted = probs.unsqueeze(-1) * stacked  # (B, L, E, D)
+        output = weighted.sum(dim=2)  # (B, L, D)
 
         # ── Çıktı projeksiyonu + Parisi gürültü ──
         output = self.out_proj(output)
@@ -308,8 +282,9 @@ class UnifiedParisiNashAttention(nn.Module):
         # İstatistikler
         with torch.no_grad():
             usage = torch.zeros(self.num_experts, device=x.device)
+            flat_idx = indices.squeeze(-1)  # (B, L)
             for i in range(self.num_experts):
-                usage[i] = (flat_indices == i).float().mean()
+                usage[i] = (flat_idx == i).float().mean()
 
         info = {
             'temperature': self.router.current_temperature.item(),
@@ -320,7 +295,7 @@ class UnifiedParisiNashAttention(nn.Module):
         return output, aux_loss, info
 
 
-# ── Birleşik Blok v3 (Dual Norm) ────────────────────────────────────────────
+# ── Birleşik Blok v4 (Dual Norm) ────────────────────────────────────────────
 
 class UnifiedBlock(nn.Module):
     """İki Normlu Birleşik Parisi-Nash Bloğu."""
@@ -340,17 +315,17 @@ class UnifiedBlock(nn.Module):
         return residual + out, aux_loss, info
 
 
-# ── Birleşik Parisi-Nash Dil Modeli v3 ───────────────────────────────────────
+# ── Birleşik Parisi-Nash Dil Modeli v4 ───────────────────────────────────────
 
 class UnifiedParisiNashLLM(nn.Module):
     """
-    Birleşik Parisi-Nash Stratejik Sığırcık Dil Modeli v3.
+    Birleşik Parisi-Nash v4: Differentiable Routing.
 
-    v3: Temperature Annealing + Top-K=1 + Sparse Execution
-
-    Parisi Tavlama Metaforu:
-      Başlangıç (T=2.0): Atomlar serbest, keşif modu
-      Soğuma (T→0.3): Kristal yapı oluşur, uzmanlaşma tamamlanır
+    Önceki versiyonların evrimi:
+      v1: Parisi+Nash → collapse (tek expert)
+      v2: +LB loss → aşırı denge (T takıldı)
+      v3: +Annealing+Top1 → gradyan körlüğü (%25 sabit)
+      v4: +Differentiable → router ÖĞRENİR, expert'ler UZMANLAŞIR
     """
 
     def __init__(self, config: SwarmConfig):
@@ -370,7 +345,6 @@ class UnifiedParisiNashLLM(nn.Module):
         self.lm_head = nn.Linear(config.embed_dim, config.vocab_size, bias=False)
         self.lm_head.weight = self.tok_emb.weight
 
-        # Annealing parametreleri
         self.t_start = 2.0
         self.t_end = 0.3
         self.lb_coeff = 0.001
@@ -386,16 +360,7 @@ class UnifiedParisiNashLLM(nn.Module):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def set_annealing_step(self, step: int, total_steps: int):
-        """
-        Parisi Tavlama: Cosine schedule ile temperature ayarla.
-
-        T(t) = T_end + 0.5 * (T_start - T_end) * (1 + cos(π * t / T))
-
-        Bu, fizikte "yavaş soğutma" prensibine uyar:
-        - Başlangıçta hızlı düşer (en çok keşif başta gerekli)
-        - Ortada yavaşlar (uzmanlaşma için zaman verir)
-        - Sonda ince ayar yapar (0.3'e yakınsar)
-        """
+        """Parisi Tavlama: Cosine schedule ile temperature ayarla."""
         progress = min(step / max(total_steps, 1), 1.0)
         temperature = self.t_end + 0.5 * (self.t_start - self.t_end) * (1 + math.cos(math.pi * progress))
         for layer in self.layers:
@@ -422,6 +387,7 @@ class UnifiedParisiNashLLM(nn.Module):
         logits = self.lm_head(x)
 
         loss = None
+        ce_loss = None
         if targets is not None:
             ce_loss = F.cross_entropy(
                 logits.view(-1, self.config.vocab_size),
@@ -433,7 +399,7 @@ class UnifiedParisiNashLLM(nn.Module):
         return {
             'logits': logits,
             'loss': loss,
-            'ce_loss': ce_loss if targets is not None else None,
+            'ce_loss': ce_loss,
             'aux_loss': total_aux_loss,
             'moe_info': all_info,
         }
@@ -480,6 +446,5 @@ class UnifiedParisiNashLLM(nn.Module):
             router = layer.unified_attn.router
             stats['temperatures'].append(router.current_temperature.item())
             stats['regrets'].append(router.cumulative_regret.tolist())
-            info = layer.unified_attn.router.expert_usage.tolist()
-            stats['usages'].append(info)
+            stats['usages'].append(router.expert_usage.tolist())
         return stats

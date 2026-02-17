@@ -4,11 +4,11 @@ Birleşik Parisi-Nash v6-scale: A100/H100 Büyük Model
 ====================================================
 v5 mimarisini A100 (40GB) / H100 (80GB) için ölçeklendirir.
 
-Hedef: ~350M parametre, WikiText-103, 15K step.
+Hedef: ~350M parametre, WikiText-103, 9K step.
   - embed_dim 768, 12 layer, 12 head, 4 expert
   - WikiText-103 (~103M token) — overfitting azaltır
   - batch_size: VRAM'e göre 8/16/24 (T4/A100/H100)
-  - 15K step, warmup 1000, min_lr 5e-5
+  - 9K step, warmup 1000, min_lr 5e-5
 
 Kullanım (Colab / A100 / H100):
     PYTHONUNBUFFERED=1 python3 -u experiment_unified_v6_scale.py
@@ -18,6 +18,7 @@ T4'te VRAM yetmez; batch_size=4 veya gradient checkpointing gerekir.
 
 import json
 import math
+import os
 import time
 
 import torch
@@ -113,7 +114,7 @@ def eval_ppl(model, loader, device, max_batches=80):
 
 def main():
     # ── v6-scale: A100/H100 için büyük model ──
-    steps = 15_000
+    steps = 9_000
     block_size = 256
     lr = 5e-4
     min_lr = 5e-5
@@ -144,7 +145,7 @@ def main():
     print("  v6-scale (v5 mimarisi, büyütülmüş):")
     print("    ✓ embed 768, 12 layer, 12 head, 4 expert (~350M param)")
     print("    ✓ WikiText-103 (~103M token)")
-    print(f"    ✓ {steps} step, warmup {warmup}, min_lr {min_lr}")
+    print(f"    ✓ {steps:,} step, warmup {warmup}, min_lr {min_lr}")
     print("    ✓ lb_coeff 0.0001, decoupled clip (router 0.5, expert 1.0)")
     print(f"    ✓ batch_size {batch_size} (VRAM'e göre)")
     print()
@@ -182,8 +183,8 @@ def main():
             print(f"    {k:>25s}: {v:>12,} ({pct:>5.1f}%)")
     print()
 
-    print("  Temperature Annealing Schedule (15K step):")
-    for s in [0, 3000, 6000, 9000, 12000, 15000]:
+    print("  Temperature Annealing Schedule (9K step):")
+    for s in [0, 2000, 4000, 6000, 8000, 9000]:
         p = min(s / steps, 1.0)
         t = model.t_end + 0.5 * (model.t_start - model.t_end) * (1 + math.cos(math.pi * p))
         print(f"    Adım {s:>5d}: T = {t:.3f}")
@@ -320,6 +321,38 @@ def main():
     with open("results_unified_v6_scale.json", 'w') as f:
         json.dump(result, f, indent=2, default=str)
     print(f"  Sonuçlar: results_unified_v6_scale.json")
+
+    # ── Google Drive'a kaydet (Colab: önce Drive'ı mount et) ──
+    drive_dir = "/content/drive/MyDrive/YES_Tools_Models"
+    if os.path.exists("/content/drive"):
+        try:
+            os.makedirs(drive_dir, exist_ok=True)
+            save_path = os.path.join(drive_dir, "v6_final.pt")
+            config_dict = {
+                "vocab_size": config.vocab_size,
+                "embed_dim": config.embed_dim,
+                "num_heads": config.num_heads,
+                "num_layers": config.num_layers,
+                "max_seq_len": config.max_seq_len,
+                "dropout": config.dropout,
+                "neighbor_size": config.neighbor_size,
+                "use_multi_scale": config.use_multi_scale,
+                "noise_strength": config.noise_strength,
+                "ffn_multiplier": config.ffn_multiplier,
+                "use_nash_moe": config.use_nash_moe,
+                "num_experts": config.num_experts,
+                "top_k_experts": config.top_k_experts,
+            }
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "best_ppl": float(best_ppl),
+                "config": config_dict,
+            }, save_path)
+            print(f"  Drive'a kaydedildi: {save_path}")
+        except Exception as e:
+            print(f"  Drive kayıt hatası: {e}")
+    else:
+        print("  Drive mount yok (/content/drive). Yerel: torch.save(..., 'v6_final.pt')")
     print()
 
 

@@ -31,10 +31,11 @@ from swarm_llm.unified import UnifiedParisiNashLLM
 
 class TokenDataset(IterableDataset):
     """Streaming token dataset."""
-    def __init__(self, tokenizer, block_size=256, max_tokens=500_000_000):
+    def __init__(self, tokenizer, block_size=256, max_tokens=500_000_000, hf_token=None):
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.max_tokens = max_tokens
+        self.hf_token = hf_token
         self.buffer = []
         self.token_count = 0
 
@@ -56,13 +57,13 @@ class TokenDataset(IterableDataset):
         
         # ── DÜZELTME 3: the-stack-smol kullan (daha stabil) ──
         print("  The Stack Smol yükleniyor...")
-        code_ds = load_dataset("bigcode/the-stack-smol", streaming=True, split="train")
+        code_ds = load_dataset("bigcode/the-stack-smol", streaming=True, split="train", token=self.hf_token)
         
         print("  Turkish Wiki yükleniyor...")
-        tr_wiki = load_dataset("wikipedia", "20220301.tr", streaming=True, split="train")
+        tr_wiki = load_dataset("wikipedia", "20220301.tr", streaming=True, split="train", token=self.hf_token)
         
         print("  TinyStories yükleniyor...")
-        tiny_stories = load_dataset("roneneldan/TinyStories", streaming=True, split="train")
+        tiny_stories = load_dataset("roneneldan/TinyStories", streaming=True, split="train", token=self.hf_token)
         
         # ── DÜZELTME 2: %60 Kod, %20 TR, %20 Mantık (DeepCoder hedefi) ──
         mixed = interleave_datasets(
@@ -260,6 +261,22 @@ def main():
     print(f"  Cihaz: {device} | batch_size: {batch_size}")
     print()
     
+    # ── HuggingFace Authentication (gated dataset için) ──
+    # Token'ı environment variable'dan oku: export HF_TOKEN=your_token_here
+    hf_token = os.environ.get("HF_TOKEN")
+    if hf_token:
+        try:
+            from huggingface_hub import login
+            login(token=hf_token)
+            print("  HuggingFace authentication başarılı!")
+        except Exception as e:
+            print(f"  HuggingFace login uyarısı: {e}")
+    else:
+        print("  UYARI: HF_TOKEN environment variable bulunamadı!")
+        print("  Gated dataset'ler için: export HF_TOKEN=your_token_here")
+        print("  Devam ediliyor (public dataset'ler çalışabilir)...")
+    print()
+    
     # ── DÜZELTME 1: Tokenizer + Special Tokens ──
     from transformers import GPT2TokenizerFast
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
@@ -316,7 +333,7 @@ def main():
     
     # ── Dataset ──
     print("  v7 Okyanus dataset yükleniyor (streaming)...")
-    train_ds = TokenDataset(tokenizer, block_size, max_tokens=500_000_000)
+    train_ds = TokenDataset(tokenizer, block_size, max_tokens=500_000_000, hf_token=hf_token)
     train_loader = DataLoader(
         train_ds, 
         batch_size=batch_size, 

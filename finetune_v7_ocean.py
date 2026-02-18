@@ -52,31 +52,37 @@ class TokenDataset(IterableDataset):
                     return
 
     def _tokenize_stream(self):
-        """Tokenize streaming data with optimized ratios and error handling."""
+        """Tokenize streaming data with official datasets and robust error handling."""
         from datasets import load_dataset, interleave_datasets
         
+        print("  🌊 v7 Okyanus Kaynakları Bağlanıyor...")
+        
+        # 1. KOD (Resmi Stack Smol)
         print("  The Stack Smol yükleniyor...")
         code_ds = load_dataset("bigcode/the-stack-smol", streaming=True, split="train", token=self.hf_token)
         
-        # ── DÜZELTME: Güncel Türkçe Wikipedia formatı ──
+        # 2. TÜRKÇE (Resmi Wikimedia Wikipedia - 2023 sürümü)
+        # Not: Bu set genellikle onay gerektirmez ve çok stabildir.
         print("  Turkish Wiki yükleniyor...")
-        tr_wiki = load_dataset("vahit/turkish-wikipedia-20231101", streaming=True, split="train", token=self.hf_token)
+        tr_wiki = load_dataset("wikimedia/wikipedia", "20231101.tr", streaming=True, split="train", token=self.hf_token)
         
+        # 3. MANTIK (TinyStories)
         print("  TinyStories yükleniyor...")
         tiny_stories = load_dataset("roneneldan/TinyStories", streaming=True, split="train", token=self.hf_token)
         
-        # ── DÜZELTME 2: %60 Kod, %20 TR, %20 Mantık (DeepCoder hedefi) ──
+        # %60 Kod, %20 TR, %20 Mantık
         mixed = interleave_datasets(
             [code_ds, tr_wiki, tiny_stories], 
-            probabilities=[0.60, 0.20, 0.20]  # Kod odaklı
+            probabilities=[0.60, 0.20, 0.20],
+            seed=42  # Reproducibility için
         )
         
         for example in mixed:
-            # ── DÜZELTME: Verinin None gelme ihtimaline karşı koruma ──
-            text = example.get("text", "") or example.get("content", "")
+            # Hem 'text' hem 'content' anahtarlarını kontrol et ve None ise boş string ata
+            text = example.get("text") or example.get("content") or ""
             
-            # Sadece dolu metinleri işle (None kontrolü + string kontrolü + boş olmayan kontrolü)
-            if text and isinstance(text, str) and text.strip():
+            # Sadece gerçekten metin olan ve boş olmayan verileri işle
+            if isinstance(text, str) and text.strip():
                 tokens = self.tokenizer.encode(text, add_special_tokens=False)
                 if len(tokens) > 0:
                     yield tokens

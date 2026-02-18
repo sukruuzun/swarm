@@ -83,12 +83,24 @@ class TokenDataset(IterableDataset):
             
             # Sadece gerçekten metin olan ve boş olmayan verileri işle
             if isinstance(text, str) and text.strip():
-                tokens = self.tokenizer.encode(text, add_special_tokens=False)
-                if len(tokens) > 0:
-                    # KRİTİK: Token ID'lerini vocab_size'a göre clamp et
-                    vocab_size = len(self.tokenizer)
-                    tokens = [min(t, vocab_size - 1) for t in tokens]
-                    yield tokens
+                vocab_size = len(self.tokenizer)
+                
+                # Metni tokenize et (uyarıyı bastırmak için warnings kullan)
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message=".*sequence length.*")
+                    tokens = self.tokenizer.encode(text, add_special_tokens=False)
+                
+                # Token ID'lerini vocab_size'a göre clamp et
+                tokens = [min(t, vocab_size - 1) for t in tokens]
+                
+                # Uzun token dizilerini parçalara böl (her parça max 1000 token)
+                # Bu veri kaybını önler ve buffer'ı yönetilebilir tutar
+                max_chunk_tokens = 1000
+                for i in range(0, len(tokens), max_chunk_tokens):
+                    chunk = tokens[i:i + max_chunk_tokens]
+                    if len(chunk) > 0:
+                        yield chunk
 
 
 def collate_fn(batch):

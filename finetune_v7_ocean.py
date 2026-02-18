@@ -85,6 +85,9 @@ class TokenDataset(IterableDataset):
             if isinstance(text, str) and text.strip():
                 tokens = self.tokenizer.encode(text, add_special_tokens=False)
                 if len(tokens) > 0:
+                    # KRİTİK: Token ID'lerini vocab_size'a göre clamp et
+                    vocab_size = len(self.tokenizer)
+                    tokens = [min(t, vocab_size - 1) for t in tokens]
                     yield tokens
 
 
@@ -108,6 +111,7 @@ def resize_embeddings(model, new_vocab_size, device=None):
     old_vocab_size = model.tok_emb.weight.shape[0]
     
     if new_vocab_size == old_vocab_size:
+        print(f"  Embedding boyutu zaten doğru: {old_vocab_size}")
         return model
     
     print(f"  Embedding yeniden boyutlandırılıyor: {old_vocab_size} → {new_vocab_size}")
@@ -126,8 +130,8 @@ def resize_embeddings(model, new_vocab_size, device=None):
     
     # Eski ağırlıkları kopyala
     with torch.no_grad():
-        new_emb.weight[:old_vocab_size] = old_weight
-        new_lm_head.weight[:old_vocab_size] = old_lm_head_weight
+        new_emb.weight[:old_vocab_size].copy_(old_weight)
+        new_lm_head.weight[:old_vocab_size].copy_(old_lm_head_weight)
         
         # Yeni tokenlar için rastgele başlat (küçük std)
         if new_vocab_size > old_vocab_size:
@@ -145,10 +149,18 @@ def resize_embeddings(model, new_vocab_size, device=None):
     # Değiştir
     model.tok_emb = new_emb
     model.lm_head = new_lm_head
-    model.lm_head.weight = model.tok_emb.weight  # Weight tying
+    
+    # Weight tying: lm_head.weight'ı tok_emb.weight'a bağla (referans değil, data kopyala)
+    with torch.no_grad():
+        model.lm_head.weight.data = model.tok_emb.weight.data.clone()
     
     # Config'i güncelle
     model.config.vocab_size = new_vocab_size
+    
+    # Doğrulama
+    actual_emb_size = model.tok_emb.weight.shape[0]
+    actual_lm_size = model.lm_head.weight.shape[0]
+    print(f"  ✓ Embedding boyutu: {actual_emb_size}, LM head boyutu: {actual_lm_size}")
     
     return model
 
@@ -335,6 +347,22 @@ def main():
     # ── Embedding'i yeniden boyutlandır (yeni tokenlar için) ──
     # KRİTİK: Device'a taşıdıktan SONRA resize yap (device-aware)
     model = resize_embeddings(model, new_vocab_size, device=device)
+    
+    # ── Doğrulama: Tokenizer ve Model vocab_size eşleşmeli ──
+    tokenizer_vocab_size = len(tokenizer)
+    model_vocab_size = model.config.vocab_size
+    actual_emb_size = model.tok_emb.weight.shape[0]
+    
+    print(f"  Vocab Size Doğrulama:")
+    print(f"    Tokenizer: {tokenizer_vocab_size}")
+    print(f"    Model Config: {model_vocab_size}")
+    print(f"    Embedding: {actual_emb_size}")
+    
+    if tokenizer_vocab_size != model_vocab_size or tokenizer_vocab_size != actual_emb_size:
+        print(f"  ⚠ UYARI: Vocab size'lar eşleşmiyor! Tokenizer'a göre ayarlanıyor...")
+        model = resize_embeddings(model, tokenizer_vocab_size, device=device)
+    
+    print()
     
     total_p = sum(p.numel() for p in model.parameters())
     print(f"  Model Parametreleri: {total_p:,} ({total_p/1e6:.1f}M)")

@@ -57,9 +57,9 @@ class TokenDataset(IterableDataset):
         
         print("  🌊 v7 Okyanus Kaynakları Bağlanıyor...")
         
-        # 1. KOD (Resmi Stack Smol)
-        print("  The Stack Smol yükleniyor...")
-        code_ds = load_dataset("bigcode/the-stack-smol", streaming=True, split="train", token=self.hf_token)
+        # 1. KOD (Resmi Stack Smol - Python ağırlıklı)
+        print("  The Stack Smol (Python) yükleniyor...")
+        code_ds = load_dataset("bigcode/the-stack-smol", data_dir="data/python", streaming=True, split="train", token=self.hf_token)
         
         # 2. TÜRKÇE (Resmi Wikimedia Wikipedia - 2023 sürümü)
         # Not: Bu set genellikle onay gerektirmez ve çok stabildir.
@@ -103,7 +103,7 @@ def collate_fn(batch):
     return torch.stack(x_padded), torch.stack(y_padded)
 
 
-def resize_embeddings(model, new_vocab_size):
+def resize_embeddings(model, new_vocab_size, device=None):
     """Embedding katmanını yeni vocab_size'a göre yeniden boyutlandır."""
     old_vocab_size = model.tok_emb.weight.shape[0]
     
@@ -113,15 +113,21 @@ def resize_embeddings(model, new_vocab_size):
     print(f"  Embedding yeniden boyutlandırılıyor: {old_vocab_size} → {new_vocab_size}")
     
     embed_dim = model.tok_emb.weight.shape[1]
+    old_weight = model.tok_emb.weight.data.clone()
+    old_lm_head_weight = model.lm_head.weight.data.clone()
     
-    # Yeni embedding oluştur
-    new_emb = nn.Embedding(new_vocab_size, embed_dim)
-    new_lm_head = nn.Linear(embed_dim, new_vocab_size, bias=False)
+    # Device'ı belirle
+    if device is None:
+        device = next(model.parameters()).device
+    
+    # Yeni embedding oluştur ve device'a taşı
+    new_emb = nn.Embedding(new_vocab_size, embed_dim).to(device)
+    new_lm_head = nn.Linear(embed_dim, new_vocab_size, bias=False).to(device)
     
     # Eski ağırlıkları kopyala
     with torch.no_grad():
-        new_emb.weight[:old_vocab_size] = model.tok_emb.weight
-        new_lm_head.weight[:old_vocab_size] = model.lm_head.weight
+        new_emb.weight[:old_vocab_size] = old_weight
+        new_lm_head.weight[:old_vocab_size] = old_lm_head_weight
         
         # Yeni tokenlar için rastgele başlat (küçük std)
         if new_vocab_size > old_vocab_size:
@@ -300,6 +306,7 @@ def main():
         ]
     }
     tokenizer.add_special_tokens(special_tokens)
+    tokenizer.pad_token = tokenizer.eos_token  # Padding için EOS token kullan
     
     old_vocab_size = tokenizer.vocab_size - len(special_tokens["additional_special_tokens"])
     new_vocab_size = tokenizer.vocab_size
@@ -323,10 +330,11 @@ def main():
     # Önce eski vocab_size ile oluştur
     model = create_model_from_config(config_dict, config_dict["vocab_size"])
     model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    model.to(device)  # Önce device'a taşı
     
     # ── Embedding'i yeniden boyutlandır (yeni tokenlar için) ──
-    model = resize_embeddings(model, new_vocab_size)
-    model.to(device)
+    # KRİTİK: Device'a taşıdıktan SONRA resize yap (device-aware)
+    model = resize_embeddings(model, new_vocab_size, device=device)
     
     total_p = sum(p.numel() for p in model.parameters())
     print(f"  Model Parametreleri: {total_p:,} ({total_p/1e6:.1f}M)")

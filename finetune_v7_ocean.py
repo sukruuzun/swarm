@@ -59,17 +59,46 @@ class TokenDataset(IterableDataset):
         print("  The Stack Smol yükleniyor...")
         code_ds = load_dataset("bigcode/the-stack-smol", streaming=True, split="train", token=self.hf_token)
         
-        print("  Turkish Wiki yükleniyor...")
-        tr_wiki = load_dataset("wikipedia", "20220301.tr", streaming=True, split="train", token=self.hf_token)
-        
         print("  TinyStories yükleniyor...")
         tiny_stories = load_dataset("roneneldan/TinyStories", streaming=True, split="train", token=self.hf_token)
         
-        # ── DÜZELTME 2: %60 Kod, %20 TR, %20 Mantık (DeepCoder hedefi) ──
-        mixed = interleave_datasets(
-            [code_ds, tr_wiki, tiny_stories], 
-            probabilities=[0.60, 0.20, 0.20]  # Kod odaklı
-        )
+        # ── Turkish Wiki: Multiple fallback options ──
+        print("  Turkish Wiki yükleniyor...")
+        tr_wiki = None
+        try:
+            # Yeni Wikipedia API formatı
+            tr_wiki = load_dataset("wikipedia", language="tr", date="20220301", streaming=True, split="train", token=self.hf_token)
+            print("  ✓ Wikipedia (yeni format) yüklendi")
+        except Exception as e1:
+            print(f"  Wikipedia yükleme hatası (yeni format): {e1}")
+            try:
+                # Eski format denemesi
+                tr_wiki = load_dataset("wikipedia", "20220301.tr", streaming=True, split="train", token=self.hf_token)
+                print("  ✓ Wikipedia (eski format) yüklendi")
+            except Exception as e2:
+                print(f"  Wikipedia yükleme hatası (eski format): {e2}")
+                try:
+                    # Alternatif: Türkçe text dataset
+                    tr_wiki = load_dataset("mukavemet/turkish-text", streaming=True, split="train", token=self.hf_token)
+                    print("  ✓ Alternatif Türkçe dataset yüklendi")
+                except Exception as e3:
+                    print(f"  Alternatif dataset hatası: {e3}")
+                    print("  ⚠ UYARI: Türkçe dataset yüklenemedi, sadece kod ve TinyStories kullanılacak!")
+        
+        # ── Dataset karışımı ──
+        if tr_wiki is not None:
+            # ── DÜZELTME 2: %60 Kod, %20 TR, %20 Mantık (DeepCoder hedefi) ──
+            mixed = interleave_datasets(
+                [code_ds, tr_wiki, tiny_stories], 
+                probabilities=[0.60, 0.20, 0.20]  # Kod odaklı
+            )
+        else:
+            # Fallback: Sadece kod ve TinyStories
+            print("  Fallback: Kod %75, TinyStories %25")
+            mixed = interleave_datasets(
+                [code_ds, tiny_stories], 
+                probabilities=[0.75, 0.25]  # Kod %75, Mantık %25
+            )
         
         for example in mixed:
             text = example.get("text", example.get("content", ""))

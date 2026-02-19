@@ -261,6 +261,11 @@ class HuggingFaceBlockLoader(nn.Module):
         Tokenizer ve Model vocab_size'larının eşleştiğini kontrol et.
         Bu kontrol, karakter kayması (offset) hatalarını önler.
         Örnek: Model 'A' demek isterken '焘' (Çince karakter) basması.
+        
+        KRİTİK: Model sayılarla konuşur. Her kelimenin bir ID'si vardır.
+        - Tokenizer: "Tarih" kelimesine 150 diyor
+        - Model: 150 sayısını işliyor ve "200" diyor
+        - LM Head: Eğer offset varsa, 200 "bilgi" yerine "焘" olabilir
         """
         # Tokenizer vocab_size
         tokenizer_vocab_size = None
@@ -288,7 +293,7 @@ class HuggingFaceBlockLoader(nn.Module):
         }
         
         # Tüm vocab_size'ları yazdır (debug için)
-        print(f"📊 Vocab Size Kontrolü:")
+        print(f"📊 Vocab Size Kontrolü (Sayısal Karşılık Kontrolü):")
         for name, size in vocab_sizes.items():
             if size is not None:
                 print(f"   {name}: {size}")
@@ -299,11 +304,47 @@ class HuggingFaceBlockLoader(nn.Module):
         sizes = [v for v in vocab_sizes.values() if v is not None]
         if len(sizes) > 1:
             if len(set(sizes)) > 1:
-                print(f"⚠️  UYARI: Vocab size uyumsuzluğu tespit edildi!")
-                print(f"   Bu durum karakter kayması (offset) hatalarına neden olabilir.")
+                print(f"\n⚠️  KRİTİK UYARI: Vocab size uyumsuzluğu tespit edildi!")
+                print(f"   Bu durum karakter kayması (offset) hatalarına neden olur.")
                 print(f"   Örnek: Model 'A' demek isterken '焘' (Çince karakter) basabilir.")
+                print(f"\n   🔍 Analiz:")
+                print(f"   - Tokenizer vocab_size: {tokenizer_vocab_size}")
+                print(f"   - Embedding vocab_size: {embed_vocab_size}")
+                print(f"   - LM Head vocab_size: {lm_head_vocab_size}")
+                print(f"\n   💡 Çözüm:")
+                if embed_vocab_size and lm_head_vocab_size:
+                    if embed_vocab_size == lm_head_vocab_size:
+                        print(f"   - Embedding ve LM Head eşleşiyor ({embed_vocab_size})")
+                        print(f"   - Sorun: Tokenizer ile Model arasında offset var")
+                        print(f"   - Model checkpoint'teki vocab_size kullanılacak: {embed_vocab_size}")
+                    else:
+                        print(f"   - Embedding ({embed_vocab_size}) != LM Head ({lm_head_vocab_size})")
+                        print(f"   - Bu durum ciddi bir sorun! Checkpoint'i kontrol edin.")
+                print(f"\n   🧪 Test: no_sharding=True ile test edin")
+                print(f"   - Çalışıyorsa: Sorun sharding'de")
+                print(f"   - Hala bozuksa: Sorun vocab mapping'de")
             else:
                 print(f"✅ Vocab size'lar eşleşiyor: {sizes[0]}")
+        
+        # Token ID mapping kontrolü (opsiyonel ama önerilir)
+        # Test: Basit bir token'ın ID'sini kontrol et
+        try:
+            test_tokens = ["The", "history", "of"]
+            print(f"\n🔍 Token ID Mapping Kontrolü:")
+            for test_token in test_tokens:
+                try:
+                    token_id = self.tokenizer.encode(test_token, add_special_tokens=False)[0]
+                    decoded = self.tokenizer.decode([token_id])
+                    print(f"   '{test_token}' → ID: {token_id} → Decode: '{decoded}'")
+                    
+                    # ID'nin vocab_size içinde olduğundan emin ol
+                    if embed_vocab_size and token_id >= embed_vocab_size:
+                        print(f"   ⚠️  UYARI: Token ID {token_id} >= Embedding vocab_size {embed_vocab_size}")
+                        print(f"      Bu durum IndexError'a neden olabilir!")
+                except Exception as e:
+                    print(f"   ⚠️  Token '{test_token}' kontrol edilemedi: {e}")
+        except Exception as e:
+            print(f"   Token ID mapping kontrolü atlandı: {e}")
     
     def _get_embed_dim(self) -> int:
         """Embedding boyutunu bul."""
@@ -807,9 +848,21 @@ class HuggingFaceBlockLoader(nn.Module):
             
             if tokenizer_vocab_size is not None:
                 if embed_vocab_size != tokenizer_vocab_size:
-                    print(f"⚠️  UYARI: Tokenizer vocab_size ({tokenizer_vocab_size}) != Model vocab_size ({embed_vocab_size})")
-                    print(f"   Bu durum karakter kayması (offset) hatalarına neden olabilir.")
-                    print(f"   Model checkpoint'teki vocab_size kullanılacak ({embed_vocab_size}).")
+                    print(f"\n⚠️  KRİTİK UYARI: Tokenizer vocab_size ({tokenizer_vocab_size}) != Model vocab_size ({embed_vocab_size})")
+                    print(f"   Bu durum karakter kayması (offset) hatalarına neden olur.")
+                    print(f"   Örnek: Model 'A' demek isterken '焘' (Çince karakter) basabilir.")
+                    print(f"\n   🔍 Analiz:")
+                    offset = embed_vocab_size - tokenizer_vocab_size
+                    print(f"   - Offset: {offset} token (Model daha büyük)")
+                    print(f"   - Tokenizer: Token ID'leri 0-{tokenizer_vocab_size-1} arası")
+                    print(f"   - Model: Token ID'leri 0-{embed_vocab_size-1} arası bekliyor")
+                    print(f"\n   💡 Çözüm:")
+                    print(f"   - Model checkpoint'teki vocab_size kullanılacak: {embed_vocab_size}")
+                    print(f"   - Tokenizer'ın token ID'leri model'in embedding matrisine uyacak şekilde ayarlanmalı")
+                    print(f"   - Eğer tokenizer'ın ID'leri model'in beklediği aralığın dışındaysa, IndexError oluşabilir")
+                    print(f"\n   🧪 Test: no_sharding=True ile test edin")
+                    print(f"   - Çalışıyorsa: Sorun sharding'de")
+                    print(f"   - Hala bozuksa: Sorun vocab mapping offset'inde")
                 else:
                     print(f"✅ Tokenizer ve Model vocab_size eşleşiyor: {embed_vocab_size}")
             

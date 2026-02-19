@@ -929,12 +929,12 @@ class HuggingFaceBlockLoader(nn.Module):
         for step in range(max_new_tokens):
             current_token_idx = initial_prompt_len + step
             
-            # KRİTİK: Causal attention mask oluştur
-            seq_len = generated.shape[1]
-            attention_mask = torch.ones(1, seq_len, dtype=torch.long, device=self.device)
+            # Qwen2 gibi modern modeller causal masking'i kendi içinde halleder
+            # Dışarıdan attention_mask göndermek dtype uyumsuzluğuna neden olabilir
+            # (SDPA bool/float bekler, long gönderirsek RuntimeError)
             
             # Her adımda TÜM bağlamı forward'a gönder (KV Cache olmadığı için)
-            outputs = self.forward(generated, attention_mask=attention_mask, use_cache=False, current_token_idx=current_token_idx)
+            outputs = self.forward(generated, attention_mask=None, use_cache=False, current_token_idx=current_token_idx)
             
             # Eğer sticky blocks yoksa veya süresi dolduysa, yeni blokları sabitle
             # NO-SHARDING modunda sticky routing yok (zaten tek blok var)

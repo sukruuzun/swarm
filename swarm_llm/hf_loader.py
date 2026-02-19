@@ -571,28 +571,36 @@ class HuggingFaceBlockLoader(nn.Module):
         router.to(device_obj)
         
         # Embedding için dummy model gerekli (sadece embed_layer için)
-        # Gerçek kullanımda tokenizer'dan vocab_size alınabilir
+        # Checkpoint'ten gerçek ağırlık boyutunu alalım
+        # Tokenizer'dan vocab_size almak yerine, checkpoint'teki gerçek boyutu kullan
         embed_dim = config['embed_dim']
-        vocab_size = tokenizer.vocab_size if hasattr(tokenizer, 'vocab_size') else 50257
-        embed_layer = nn.Embedding(vocab_size, embed_dim)
+        embed_weight = router_data['embed_state_dict']['weight']
+        real_vocab_size = embed_weight.shape[0]  # Checkpoint'teki gerçek vocab_size (örn: 152064)
+        
+        embed_layer = nn.Embedding(real_vocab_size, embed_dim)
         embed_layer.load_state_dict(router_data['embed_state_dict'])
         embed_layer.to(device_obj)
         
         # Final norm ve LM head'i yükle (lazy loading için)
         final_norm = None
         lm_head = None
+        
+        # Final norm yükle (eğer varsa)
         if config.get('has_final_norm', False):
             if router_data.get('final_norm_state_dict'):
                 # Final norm oluştur (embed_dim'e göre)
                 final_norm = nn.LayerNorm(embed_dim)
                 final_norm.load_state_dict(router_data['final_norm_state_dict'])
                 final_norm.to(device_obj)
-            
-            if router_data.get('lm_head_state_dict'):
-                # LM head oluştur
-                lm_head = nn.Linear(embed_dim, vocab_size, bias=False)
-                lm_head.load_state_dict(router_data['lm_head_state_dict'])
-                lm_head.to(device_obj)
+        
+        # LM head yükle (has_final_norm kontrolünden bağımsız)
+        if router_data.get('lm_head_state_dict'):
+            # LM head için de checkpoint'teki gerçek vocab_size'ı kullan
+            lm_head_weight = router_data['lm_head_state_dict']['weight']
+            lm_head_vocab_size = lm_head_weight.shape[0]  # Checkpoint'teki gerçek vocab_size
+            lm_head = nn.Linear(embed_dim, lm_head_vocab_size, bias=False)
+            lm_head.load_state_dict(router_data['lm_head_state_dict'])
+            lm_head.to(device_obj)
         
         # Lazy loader oluştur
         loader = cls.__new__(cls)

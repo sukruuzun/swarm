@@ -177,8 +177,18 @@ def run_sharded_demo(model, tokenizer, num_blocks: int, top_k: int, prompt: str,
         print(f"\n💾 Bloklar diske kaydediliyor: {save_dir}")
         loader.save_blocks_to_disk(save_dir)
     
-    # Metin üretimi
-    print(f"\n🔄 Metin üretimi başlıyor (sharding modu)...")
+    # Router kalibrasyonu
+    print(f"\n🎓 Router kalibrasyonu başlıyor...")
+    loader.calibrate_router(num_steps=50)
+    
+    # Kalibre edilmiş router ile blok tahmini
+    block_indices2, weights2 = loader.predict_blocks(prompt, prefetch=False)
+    print(f"🔮 Kalibre edilmiş blok tahmini:")
+    print(f"   Tahmin edilen bloklar: {block_indices2}")
+    print(f"   Ağırlıklar: {[f'{w:.2%}' for w in weights2.tolist()]}")
+    
+    # Metin üretimi (kalibre edilmiş router ile)
+    print(f"\n🔄 Metin üretimi başlıyor (kalibre edilmiş sharding modu)...")
     generated = loader.generate(
         prompt=prompt,
         max_new_tokens=100,

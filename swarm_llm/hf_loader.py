@@ -36,40 +36,6 @@ from queue import Queue
 from swarm_llm.external_router import ExternalParisiNashRouter
 
 
-class _StateDictModule(nn.Module):
-    """
-    Lazy loading için hafif state_dict taşıyıcı modül.
-    Diskten yüklenen blokların yapısını yeniden oluşturmak için kullanılır.
-    
-    Bu modül, state_dict'ten yüklenen parametreleri doğru şekilde tutar
-    ve forward pass'te bu parametreleri kullanarak transformer katmanı gibi çalışır.
-    
-    KRİTİK: Bu modül sadece state_dict yükleme/kaydetme için kullanılır.
-    Gerçek forward pass, _load_parameters_as_dict üzerinden yapılır.
-    """
-    def __init__(self):
-        super().__init__()
-    
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-        """
-        State dict'ten parametreleri otomatik olarak yükle.
-        Her parametre nn.Parameter olarak kaydedilir.
-        """
-        # Prefix ile eşleşen tüm anahtarları bul
-        for key, value in state_dict.items():
-            if key.startswith(prefix):
-                local_key = key[len(prefix):]
-                if '.' not in local_key:  # Sadece doğrudan alt parametreler
-                    self.register_parameter(local_key, nn.Parameter(value))
-                    # Bu anahtarı missing_keys'den kaldır
-                    if key in missing_keys:
-                        missing_keys.remove(key)
-    
-    def forward(self, x, **kwargs):
-        """Forward pass — state_dict yüklendiyse parametreler kullanılır."""
-        return x
-
-
 class QwenBlockWrapper(nn.Module):
     """
     Qwen2 için özel block wrapper.
@@ -1312,54 +1278,140 @@ class HuggingFaceBlockLoader(nn.Module):
         
         return loader
 
-    @staticmethod
-    def _rebuild_block_from_disk(block_path: str, device) -> nn.Module:
+    def calibrate_router(
+        self,
+        calibration_prompts: list = None,
+        num_steps: int = 50,
+        lr: float = 1e-3,
+    ):
         """
-        Diskten blok verisini okuyup, state_dict'i doğrudan yüklenmiş
-        nn.Module olarak döndür. Blok yapısını (QwenBlockWrapper vs Sequential)
-        checkpoint'teki metadata'dan yeniden oluşturur.
+        Router'ı küçük bir kalibrasyon setiyle eğit.
+        
+        Her blok için "bu prompt'a ne kadar katkı yapıyor?" sorusunu yanıtlar.
+        Blokların gerçek çıktı katkısını ölçerek router'ın gate ağırlıklarını optimize eder.
         
         Args:
-            block_path: Blok dosyasının yolu
-            device: Hedef cihaz
-        
-        Returns:
-            Yüklenmiş blok modülü (state_dict yüklenmiş)
+            calibration_prompts: Kalibrasyon cümleleri listesi
+            num_steps: Optimizasyon adım sayısı
+            lr: Learning rate
         """
-        try:
-            block_data = torch.load(block_path, map_location=device, weights_only=False)
-        except Exception:
-            block_data = torch.load(block_path, map_location='cpu', weights_only=False)
+        if calibration_prompts is None:
+            calibration_prompts = [
+                "The history of artificial intelligence is",
+                "In mathematics, a prime number is",
+                "The capital of France is Paris, which is known for",
+                "def fibonacci(n):\n    if n <= 1:\n        return n",
+                "Machine learning models can be trained using",
+                "The theory of relativity states that",
+                "To cook a perfect pasta, you need to",
+                "The human brain contains approximately",
+            ]
         
-        state_dict = block_data['state_dict']
-        block_type = block_data.get('block_type', 'Sequential')
-        num_layers = block_data.get('num_layers_in_block', 0)
+        print(f"\n{'='*60}")
+        print(f"🎓 ROUTER KALİBRASYONU")
+        print(f"{'='*60}")
+        print(f"   Prompt sayısı: {len(calibration_prompts)}")
+        print(f"   Adım sayısı: {num_steps}")
+        print(f"   Learning rate: {lr}")
         
-        # State dict'ten katman yapısını çıkar ve doğru wrapper'ı oluştur
-        # Anahtar formatı: "layers.0.layer.self_attn..." (QwenBlockWrapper)
-        #                  veya "0.layer.self_attn..." (Sequential)
+        # Router'ı eğitim moduna al
+        self.router.train()
+        optimizer = torch.optim.Adam(self.router.parameters(), lr=lr)
         
-        if block_type == 'QwenBlockWrapper' or 'layers.' in next(iter(state_dict.keys()), ''):
-            # QwenBlockWrapper: Katmanları DummyLayer ile oluştur ve state_dict yükle
-            # DummyLayer — sadece state_dict taşıyıcı, forward'da parametreleri kullanır
-            dummy_layers = [_StateDictModule() for _ in range(num_layers)]
-            block = QwenBlockWrapper(dummy_layers)
-        else:
-            dummy_layers = [_StateDictModule() for _ in range(num_layers)]
-            block = nn.Sequential(*dummy_layers)
+        # Adım 1: Her blok için her prompt'un katkısını ölç
+        print(f"\n📊 Blok katkıları ölçülüyor...")
+        block_contributions = []  # [(x_embed, contribution_vector), ...]
         
-        # State dict'i yükle (strict=False: yapı tam uyuşmayabilir)
-        try:
-            block.load_state_dict(state_dict, strict=True)
-        except Exception:
-            try:
-                block.load_state_dict(state_dict, strict=False)
-            except Exception as e:
-                print(f"⚠️  Blok yükleme uyarısı: {e}")
+        for p_idx, prompt in enumerate(calibration_prompts):
+            input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
+            
+            with torch.no_grad():
+                x = self.embed_layer(input_ids)
+                
+                # Her bloğun katkısını ölç (residual farkı)
+                contributions = torch.zeros(self.num_blocks, device=self.device)
+                x_running = x.clone()
+                
+                for block_idx in range(self.num_blocks):
+                    if self._lazy_load:
+                        block = self._load_block_from_disk(block_idx)
+                    else:
+                        block = self.blocks[block_idx]
+                    
+                    # Position embeddings hesapla
+                    position_embeddings = None
+                    L = x_running.shape[1]
+                    position_ids = torch.arange(L, device=self.device).unsqueeze(0)
+                    
+                    if self._is_qwen and self._rotary_emb is not None:
+                        try:
+                            cos, sin = self._rotary_emb(x_running, position_ids)
+                            position_embeddings = (cos.to(self.device), sin.to(self.device))
+                        except Exception:
+                            pass
+                    
+                    # Bloğu çalıştır
+                    if isinstance(block, QwenBlockWrapper) and position_embeddings is not None:
+                        block_out = block(x_running, position_embeddings=position_embeddings,
+                                         position_ids=position_ids, attention_mask=None)
+                    else:
+                        block_out = block(x_running)
+                    
+                    if isinstance(block_out, tuple):
+                        block_out = block_out[0]
+                    
+                    # Katkı = bu bloğun hidden state'e ne kadar değişiklik yaptığı
+                    contribution = (block_out - x_running).float().norm().item()
+                    contributions[block_idx] = contribution
+                    x_running = block_out
+                
+                # Normalize et (0-1 arası)
+                if contributions.sum() > 0:
+                    contributions = contributions / contributions.sum()
+                
+                block_contributions.append((x, contributions))
+            
+            if p_idx == 0:
+                print(f"   İlk prompt blok katkıları: {[f'{c:.3f}' for c in contributions.tolist()]}")
         
-        block.to(device)
-        block.eval()
-        return block
+        # Adım 2: Router'ı blok katkılarına göre eğit
+        print(f"\n🔧 Router eğitiliyor ({num_steps} adım)...")
+        
+        for step in range(num_steps):
+            total_loss = 0.0
+            
+            for x_embed, target_contributions in block_contributions:
+                # Router'ın tahmin ettiği olasılıklar
+                probs, _, aux_loss, _ = self.router(x_embed, pool_input=True)
+                probs_squeezed = probs.squeeze()  # (num_blocks,)
+                
+                # Hedef: Router'ın olasılıkları gerçek katkılara yakınsın
+                target = target_contributions.detach()
+                loss = torch.nn.functional.mse_loss(probs_squeezed, target) + 0.01 * aux_loss
+                
+                total_loss += loss.item()
+                
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+            
+            if (step + 1) % 10 == 0:
+                avg_loss = total_loss / len(block_contributions)
+                print(f"   Adım {step+1}/{num_steps}: Loss = {avg_loss:.6f}")
+        
+        # Router'ı eval moduna al
+        self.router.eval()
+        
+        # Sonuçları göster
+        print(f"\n✅ Router kalibrasyonu tamamlandı!")
+        
+        # Test: İlk prompt ile tahmin
+        test_prompt = calibration_prompts[0]
+        block_indices, weights = self.predict_blocks(test_prompt, prefetch=False)
+        print(f"   Test: '{test_prompt[:50]}...'")
+        print(f"   Seçilen bloklar: {block_indices}")
+        print(f"   Ağırlıklar: {[f'{w:.2%}' for w in weights.tolist()]}")
+        print(f"{'='*60}\n")
 
     def _load_block_from_disk(self, block_idx: int) -> nn.Module:
         """
@@ -1455,23 +1507,41 @@ class HuggingFaceBlockLoader(nn.Module):
                         self._load_block_from_disk(block_idx)
                 
                 self._prefetch_queue.task_done()
-            except:
+            except Exception:
                 continue
 
-    def start_prefetching(self):
-        """Asenkron prefetching'i başlat."""
-        if self._prefetch_thread is None or not self._prefetch_thread.is_alive():
-            self._prefetch_running = True
-            self._prefetch_thread = threading.Thread(target=self._prefetch_worker, daemon=True)
-            self._prefetch_thread.start()
-            print("🚀 Asenkron prefetching başlatıldı")
+    def start_prefetching(self, num_workers: int = 2):
+        """
+        Asenkron prefetching'i başlat.
+        
+        Args:
+            num_workers: Paralel prefetch thread sayısı (default: 2)
+        """
+        if not hasattr(self, '_prefetch_threads'):
+            self._prefetch_threads = []
+        
+        # Çalışan thread var mı kontrol et
+        alive = [t for t in self._prefetch_threads if t.is_alive()]
+        if len(alive) >= num_workers:
+            return
+        
+        self._prefetch_running = True
+        for i in range(num_workers - len(alive)):
+            t = threading.Thread(target=self._prefetch_worker, daemon=True)
+            t.start()
+            self._prefetch_threads.append(t)
+        
+        print(f"🚀 Asenkron prefetching başlatıldı ({num_workers} worker)")
 
     def stop_prefetching(self):
         """Asenkron prefetching'i durdur."""
         self._prefetch_running = False
-        self._prefetch_queue.put(None)  # Shutdown signal
-        if self._prefetch_thread is not None:
-            self._prefetch_thread.join(timeout=2.0)
+        # Her worker için shutdown signal
+        for _ in range(len(getattr(self, '_prefetch_threads', []))):
+            self._prefetch_queue.put(None)
+        for t in getattr(self, '_prefetch_threads', []):
+            t.join(timeout=2.0)
+        self._prefetch_threads = []
         print("⏹️  Asenkron prefetching durduruldu")
 
     def prefetch_blocks(self, block_indices: List[int]):
@@ -1486,7 +1556,7 @@ class HuggingFaceBlockLoader(nn.Module):
             return
         
         # Prefetching başlatılmamışsa başlat
-        if self._prefetch_thread is None or not self._prefetch_thread.is_alive():
+        if not getattr(self, '_prefetch_threads', None) or not any(t.is_alive() for t in self._prefetch_threads):
             self.start_prefetching()
         
         # Blokları kuyruğa ekle

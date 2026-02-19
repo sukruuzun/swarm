@@ -25,7 +25,6 @@ from swarm_llm.hf_loader import (
     HuggingFaceBlockLoader,
     QwenBlockWrapper,
     TupleCleaner,
-    _StateDictModule,
 )
 from swarm_llm.external_router import ExternalParisiNashRouter
 

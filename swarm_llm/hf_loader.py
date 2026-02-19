@@ -1281,20 +1281,20 @@ class HuggingFaceBlockLoader(nn.Module):
     def calibrate_router(
         self,
         calibration_prompts: list = None,
-        num_steps: int = 50,
+        num_steps: int = 100,
         lr: float = 1e-3,
     ):
         """
-        Router'ı küçük bir kalibrasyon setiyle eğit.
+        Router'ı Knowledge Distillation ile eğit.
         
-        Her blok için "bu prompt'a ne kadar katkı yapıyor?" sorusunu yanıtlar.
-        Blokların gerçek çıktı katkısını ölçerek router'ın gate ağırlıklarını optimize eder.
-        
-        Args:
-            calibration_prompts: Kalibrasyon cümleleri listesi
-            num_steps: Optimizasyon adım sayısı
-            lr: Learning rate
+        Strateji:
+        1. Teacher: Tüm bloklar sırayla → referans logits
+        2. Ablasyon: Her top_k blok kombinasyonu test edilir, KL divergence ölçülür
+        3. En iyi kombinasyon bulunur
+        4. Router bu kombinasyonları seçmeyi öğrenir
         """
+        import itertools
+        
         if calibration_prompts is None:
             calibration_prompts = [
                 "The history of artificial intelligence is",
@@ -1308,117 +1308,116 @@ class HuggingFaceBlockLoader(nn.Module):
             ]
         
         print(f"\n{'='*60}")
-        print(f"🎓 ROUTER KALİBRASYONU")
+        print(f"🎓 ROUTER KALİBRASYONU (Knowledge Distillation)")
         print(f"{'='*60}")
-        print(f"   Prompt sayısı: {len(calibration_prompts)}")
-        print(f"   Adım sayısı: {num_steps}")
-        print(f"   Learning rate: {lr}")
+        print(f"   Blok: {self.num_blocks}, top_k: {self.top_k}")
         
-        # Router'ı eğitim moduna al
-        # KRİTİK: Router float16 olabilir ama backward pass float32 ister
+        all_combos = list(itertools.combinations(range(self.num_blocks), self.top_k))
+        print(f"   Test edilecek kombinasyon: {len(all_combos)}")
+        
+        # ── ADIM 1: Teacher logits (tüm bloklar sırayla) ──
+        print(f"\n📖 Adım 1: Teacher (tüm {self.num_blocks} blok)...")
+        teacher_data = []
+        
+        for prompt in calibration_prompts:
+            input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
+            with torch.no_grad():
+                x = self.embed_layer(input_ids)
+                x_running = x.clone()
+                for bi in range(self.num_blocks):
+                    block = self._load_block_from_disk(bi) if self._lazy_load else self.blocks[bi]
+                    x_running = self._run_single_block(block, x_running)
+                t_logits = self.lm_head(self.final_norm(x_running) if self.final_norm else x_running)
+                teacher_data.append((x, t_logits))
+        print(f"   ✅ {len(calibration_prompts)} teacher logits hazır")
+        
+        # ── ADIM 2: Ablasyon (her kombinasyon) ──
+        print(f"\n🔬 Adım 2: {len(all_combos)} kombinasyon test ediliyor...")
+        combo_scores = {}
+        
+        for combo in all_combos:
+            total_kl = 0.0
+            for x_embed, t_logits in teacher_data:
+                with torch.no_grad():
+                    x_running = x_embed.clone()
+                    for bi in sorted(combo):
+                        block = self._load_block_from_disk(bi) if self._lazy_load else self.blocks[bi]
+                        x_running = self._run_single_block(block, x_running)
+                    s_logits = self.lm_head(self.final_norm(x_running) if self.final_norm else x_running)
+                    t_p = torch.nn.functional.softmax(t_logits.float(), dim=-1)
+                    s_lp = torch.nn.functional.log_softmax(s_logits.float(), dim=-1)
+                    kl = torch.nn.functional.kl_div(s_lp, t_p, reduction='batchmean')
+                    total_kl += kl.item()
+            combo_scores[combo] = total_kl / len(teacher_data)
+        
+        sorted_combos = sorted(combo_scores.items(), key=lambda x: x[1])
+        print(f"\n📊 En İyi 5 Kombinasyon:")
+        for rank, (combo, kl) in enumerate(sorted_combos[:5]):
+            m = ["🥇", "🥈", "🥉", "  ", "  "][rank]
+            print(f"   {m} Blok {list(combo)}: KL = {kl:.4f}")
+        
+        best_combo = sorted_combos[0][0]
+        print(f"\n   🏆 En iyi: {list(best_combo)} (KL={sorted_combos[0][1]:.4f})")
+        print(f"   ❌ En kötü: {list(sorted_combos[-1][0])} (KL={sorted_combos[-1][1]:.4f})")
+        
+        # ── ADIM 3: Router eğitimi ──
+        print(f"\n🔧 Adım 3: Router eğitimi ({num_steps} adım)...")
+        
+        target_dist = torch.zeros(self.num_blocks, device=self.device)
+        for combo, kl in combo_scores.items():
+            score = 1.0 / (kl + 1e-6)
+            for bi in combo:
+                target_dist[bi] += score
+        target_dist = target_dist / target_dist.sum()
+        print(f"   Hedef dağılım: {[f'{t:.3f}' for t in target_dist.tolist()]}")
+        
         original_dtype = next(self.router.parameters()).dtype
         if original_dtype != torch.float32:
-            self.router = self.router.float()  # Kalibrasyon için float32
+            self.router = self.router.float()
         self.router.train()
         optimizer = torch.optim.Adam(self.router.parameters(), lr=lr)
         
-        # Adım 1: Her blok için her prompt'un katkısını ölç
-        print(f"\n📊 Blok katkıları ölçülüyor...")
-        block_contributions = []  # [(x_embed, contribution_vector), ...]
-        
-        for p_idx, prompt in enumerate(calibration_prompts):
-            input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
-            
-            with torch.no_grad():
-                x = self.embed_layer(input_ids)
-                
-                # Her bloğun katkısını ölç (residual farkı)
-                contributions = torch.zeros(self.num_blocks, device=self.device)
-                x_running = x.clone()
-                
-                for block_idx in range(self.num_blocks):
-                    if self._lazy_load:
-                        block = self._load_block_from_disk(block_idx)
-                    else:
-                        block = self.blocks[block_idx]
-                    
-                    # Position embeddings hesapla
-                    position_embeddings = None
-                    L = x_running.shape[1]
-                    position_ids = torch.arange(L, device=self.device).unsqueeze(0)
-                    
-                    if self._is_qwen and self._rotary_emb is not None:
-                        try:
-                            cos, sin = self._rotary_emb(x_running, position_ids)
-                            position_embeddings = (cos.to(self.device), sin.to(self.device))
-                        except Exception:
-                            pass
-                    
-                    # Bloğu çalıştır
-                    if isinstance(block, QwenBlockWrapper) and position_embeddings is not None:
-                        block_out = block(x_running, position_embeddings=position_embeddings,
-                                         position_ids=position_ids, attention_mask=None)
-                    else:
-                        block_out = block(x_running)
-                    
-                    if isinstance(block_out, tuple):
-                        block_out = block_out[0]
-                    
-                    # Katkı = bu bloğun hidden state'e ne kadar değişiklik yaptığı
-                    contribution = (block_out - x_running).float().norm().item()
-                    contributions[block_idx] = contribution
-                    x_running = block_out
-                
-                # Normalize et (0-1 arası)
-                if contributions.sum() > 0:
-                    contributions = contributions / contributions.sum()
-                
-                block_contributions.append((x, contributions))
-            
-            if p_idx == 0:
-                print(f"   İlk prompt blok katkıları: {[f'{c:.3f}' for c in contributions.tolist()]}")
-        
-        # Adım 2: Router'ı blok katkılarına göre eğit
-        print(f"\n🔧 Router eğitiliyor ({num_steps} adım)...")
-        
         for step in range(num_steps):
             total_loss = 0.0
-            
-            for x_embed, target_contributions in block_contributions:
-                # Router'ın tahmin ettiği olasılıklar (float32)
-                x_f32 = x_embed.float()
-                probs, _, aux_loss, _ = self.router(x_f32, pool_input=True)
-                probs_squeezed = probs.squeeze()  # (num_blocks,)
-                
-                # Hedef: Router'ın olasılıkları gerçek katkılara yakınsın
-                target = target_contributions.detach()
-                loss = torch.nn.functional.mse_loss(probs_squeezed, target) + 0.01 * aux_loss
-                
+            for x_embed, _ in teacher_data:
+                probs, _, aux_loss, _ = self.router(x_embed.float(), pool_input=True)
+                loss = torch.nn.functional.mse_loss(probs.squeeze(), target_dist) + 0.01 * aux_loss
                 total_loss += loss.item()
-                
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-            
-            if (step + 1) % 10 == 0:
-                avg_loss = total_loss / len(block_contributions)
-                print(f"   Adım {step+1}/{num_steps}: Loss = {avg_loss:.6f}")
+            if (step + 1) % 20 == 0:
+                print(f"   Adım {step+1}/{num_steps}: Loss = {total_loss / len(teacher_data):.6f}")
         
-        # Router'ı eval moduna al ve eski dtype'a geri dön
         self.router.eval()
         if original_dtype != torch.float32:
             self.router = self.router.to(dtype=original_dtype)
         
-        # Sonuçları göster
-        print(f"\n✅ Router kalibrasyonu tamamlandı!")
-        
-        # Test: İlk prompt ile tahmin
+        # Sonuç
+        print(f"\n✅ Kalibrasyon tamamlandı!")
         test_prompt = calibration_prompts[0]
-        block_indices, weights = self.predict_blocks(test_prompt, prefetch=False)
-        print(f"   Test: '{test_prompt[:50]}...'")
-        print(f"   Seçilen bloklar: {block_indices}")
-        print(f"   Ağırlıklar: {[f'{w:.2%}' for w in weights.tolist()]}")
+        idxs, wts = self.predict_blocks(test_prompt, prefetch=False)
+        print(f"   Router seçimi: {idxs} (en iyi: {list(best_combo)})")
+        print(f"   {'✅ Eşleşti!' if set(idxs) == set(best_combo) else '⚠️  Yakın ama tam eşleşmedi'}")
         print(f"{'='*60}\n")
+    
+    def _run_single_block(self, block, x):
+        """Tek bir bloğu position_embeddings ile çalıştır."""
+        position_embeddings = None
+        L = x.shape[1]
+        position_ids = torch.arange(L, device=self.device).unsqueeze(0)
+        if self._is_qwen and self._rotary_emb is not None:
+            try:
+                cos, sin = self._rotary_emb(x, position_ids)
+                position_embeddings = (cos.to(self.device), sin.to(self.device))
+            except Exception:
+                pass
+        if isinstance(block, QwenBlockWrapper) and position_embeddings is not None:
+            out = block(x, position_embeddings=position_embeddings,
+                        position_ids=position_ids, attention_mask=None)
+        else:
+            out = block(x)
+        return out[0] if isinstance(out, tuple) else out
 
     def _load_block_from_disk(self, block_idx: int) -> nn.Module:
         """

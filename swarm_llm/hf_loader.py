@@ -167,6 +167,13 @@ class HuggingFaceBlockLoader(nn.Module):
             # Model henüz dağıtılmamış (GPT-2 gibi küçük modeller), taşı
             self.model.to(self.device)
 
+        # KRİTİK: Qwen modeli kontrolünü en başta yap (no_sharding kontrolünden önce)
+        # Çünkü no_sharding modunda QwenBlockWrapper kullanmak için _is_qwen gerekli
+        self._is_qwen = self._detect_qwen_model()
+        self._rotary_emb = None
+        if self._is_qwen and self.model is not None:
+            self._rotary_emb = self._extract_rotary_embeddings()
+
         # NO-SHARDING TEST MODU: Modeli hiç bölmeden tek blok olarak çalıştır
         # Bu mod, sorunun sharding'den mi yoksa model yükleme/tokenizer'dan mı kaynaklandığını test eder
         self.no_sharding = no_sharding
@@ -222,12 +229,6 @@ class HuggingFaceBlockLoader(nn.Module):
 
         # Embedding layer'ı bul
         self.embed_layer = self._get_embed_layer()
-        
-        # Qwen2 modeli için rotary embeddings'i sakla (position_embeddings için)
-        self._is_qwen = self._detect_qwen_model()
-        self._rotary_emb = None
-        if self._is_qwen and self.model is not None:
-            self._rotary_emb = self._extract_rotary_embeddings()
         
         # KRİTİK: Tokenizer ve Model vocab_size kontrolü
         # Bu kontrol, karakter kayması (offset) hatalarını önler

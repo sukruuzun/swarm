@@ -335,28 +335,43 @@ class HuggingFaceBlockLoader(nn.Module):
     def _extract_rotary_embeddings(self):
         """
         Qwen modelinden rotary embeddings'i çıkar.
-        KRİTİK: Device kontrolü yapılır (GPU/CPU).
+        Yeni transformers: model.model.rotary_emb (model seviyesinde)
+        Eski transformers: layers[0].self_attn.rotary_emb (layer seviyesinde)
         """
-        if self.model is None or len(self.layers) == 0:
+        if self.model is None:
             return None
+        
+        rotary_emb = None
+        
+        # Yöntem 1: model.model.rotary_emb (yeni transformers >= 4.38)
         try:
-            first_layer = self.layers[0]
-            if hasattr(first_layer, 'self_attn'):
-                if hasattr(first_layer.self_attn, 'rotary_emb'):
+            if hasattr(self.model, 'model') and hasattr(self.model.model, 'rotary_emb'):
+                rotary_emb = self.model.model.rotary_emb
+                print(f"✅ Rotary emb bulundu: model.model.rotary_emb ({type(rotary_emb).__name__})")
+                return rotary_emb
+        except Exception:
+            pass
+        
+        # Yöntem 2: layers[0].self_attn.rotary_emb (eski transformers)
+        try:
+            if self.layers is not None and len(self.layers) > 0:
+                first_layer = self.layers[0]
+                if hasattr(first_layer, 'self_attn') and hasattr(first_layer.self_attn, 'rotary_emb'):
                     rotary_emb = first_layer.self_attn.rotary_emb
-                    # KRİTİK: Rotary embeddings'i doğru device'a taşı
-                    # Model accelerate ile dağıtılmış olabilir
-                    try:
-                        # Rotary embeddings'in device'ını kontrol et
-                        if hasattr(rotary_emb, 'cos_cached'):
-                            # Cached değerler varsa device'ı kontrol et
-                            if rotary_emb.cos_cached.device != self.device:
-                                rotary_emb = rotary_emb.to(self.device)
-                    except:
-                        pass
+                    print(f"✅ Rotary emb bulundu: layers[0].self_attn.rotary_emb ({type(rotary_emb).__name__})")
                     return rotary_emb
-        except Exception as e:
-            print(f"⚠️  Rotary embeddings çıkarılamadı: {e}")
+        except Exception:
+            pass
+        
+        print(f"⚠️  Rotary embeddings bulunamadı. Model yapısını kontrol edin.")
+        if hasattr(self.model, 'model'):
+            attrs = [a for a in dir(self.model.model) if 'rotary' in a.lower() or 'rope' in a.lower()]
+            print(f"   model.model'deki rotary/rope attributes: {attrs}")
+        if self.layers is not None and len(self.layers) > 0:
+            layer0 = self.layers[0]
+            if hasattr(layer0, 'self_attn'):
+                attrs = [a for a in dir(layer0.self_attn) if 'rotary' in a.lower() or 'rope' in a.lower()]
+                print(f"   layers[0].self_attn'deki rotary/rope attributes: {attrs}")
         return None
     
     def _get_embed_layer(self) -> nn.Module:
@@ -653,7 +668,15 @@ class HuggingFaceBlockLoader(nn.Module):
                 # Rotary embedding kaynağını bul (birden fazla fallback)
                 rotary_emb = self._rotary_emb
                 
-                # Fallback 1: _rotary_emb None ise, katmanlardan doğrudan al
+                # Fallback 1: model.model.rotary_emb (yeni transformers >= 4.38)
+                if rotary_emb is None and self.model is not None:
+                    try:
+                        if hasattr(self.model, 'model') and hasattr(self.model.model, 'rotary_emb'):
+                            rotary_emb = self.model.model.rotary_emb
+                    except Exception:
+                        pass
+                
+                # Fallback 2: layers[0].self_attn.rotary_emb (eski transformers)
                 if rotary_emb is None and self.layers is not None and len(self.layers) > 0:
                     try:
                         first_layer = self.layers[0]

@@ -638,65 +638,72 @@ class HuggingFaceBlockLoader(nn.Module):
         # Embedding
         x = self.embed_layer(input_ids)  # (B, L, D)
         
-        # KRİTİK: Qwen2 gibi modeller position_embeddings bekler (RoPE için)
-        # Rotary embeddings'i hesapla (eğer Qwen ise)
+        # KRİTİK: Qwen2 katmanları position_embeddings'i ZORUNLU olarak bekler
+        # position_embeddings = (cos, sin) tuple'ı — RoPE için gerekli
+        # Bu olmadan TypeError: cannot unpack non-iterable NoneType object hatası alınır
         position_embeddings = None
         position_ids = None
         
-        if self._is_qwen and self._rotary_emb is not None:
+        if self._is_qwen:
             try:
                 # Position IDs oluştur
                 position_ids = torch.arange(L, dtype=torch.long, device=input_ids.device)
                 position_ids = position_ids.unsqueeze(0).expand(B, -1)
                 
-                # KRİTİK: Rotary embeddings'i doğru device'a taşı
-                # Model accelerate ile dağıtılmış olabilir, rotary_emb farklı device'da olabilir
-                try:
-                    rotary_emb_device = next(self._rotary_emb.parameters()).device if hasattr(self._rotary_emb, 'parameters') else None
-                    if rotary_emb_device is not None and rotary_emb_device != input_ids.device:
-                        # Rotary embeddings'i input_ids ile aynı device'a taşı
-                        self._rotary_emb = self._rotary_emb.to(input_ids.device)
-                except:
-                    pass
+                # Rotary embedding kaynağını bul (birden fazla fallback)
+                rotary_emb = self._rotary_emb
                 
-                # Rotary embeddings'den position embeddings'i hesapla
-                # Qwen2'nin rotary_emb.forward() çağrısı
-                # Qwen2 rotary_emb genelde (cos, sin) tuple döndürür
-                try:
-                    # Qwen2 rotary_emb genelde position_ids ve seq_len alır
-                    # Ancak bazı versiyonlarda farklı imza olabilir
-                    if hasattr(self._rotary_emb, '__call__'):
-                        # rotary_emb(position_ids, seq_len=L) veya rotary_emb(position_ids)
+                # Fallback 1: _rotary_emb None ise, katmanlardan doğrudan al
+                if rotary_emb is None and self.layers is not None and len(self.layers) > 0:
+                    try:
+                        first_layer = self.layers[0]
+                        if hasattr(first_layer, 'self_attn') and hasattr(first_layer.self_attn, 'rotary_emb'):
+                            rotary_emb = first_layer.self_attn.rotary_emb
+                    except Exception:
+                        pass
+                
+                if rotary_emb is not None:
+                    # Rotary embeddings'den (cos, sin) hesapla
+                    # Farklı transformers versiyonları farklı imza kullanır
+                    cos, sin = None, None
+                    
+                    # Yöntem 1: rotary_emb(x, position_ids) — yeni transformers
+                    try:
+                        result = rotary_emb(x, position_ids)
+                        if isinstance(result, tuple) and len(result) == 2:
+                            cos, sin = result
+                    except Exception:
+                        pass
+                    
+                    # Yöntem 2: rotary_emb(position_ids, seq_len=L) — eski transformers
+                    if cos is None:
                         try:
-                            cos, sin = self._rotary_emb(position_ids, seq_len=L)
-                        except TypeError:
-                            # Farklı imza denemesi
-                            try:
-                                cos, sin = self._rotary_emb(position_ids)
-                            except:
-                                # Son çare: rotary_emb'in kendi forward metodunu kullan
-                                # Qwen2 rotary_emb.forward() genelde (position_ids, seq_len) alır
-                                cos, sin = self._rotary_emb.forward(position_ids, seq_len=L)
-                        
-                        # Device kontrolü: cos ve sin'in device'ı input_ids ile aynı olmalı
+                            cos, sin = rotary_emb(position_ids, seq_len=L)
+                        except Exception:
+                            pass
+                    
+                    # Yöntem 3: rotary_emb(position_ids) — bazı versiyonlar
+                    if cos is None:
+                        try:
+                            cos, sin = rotary_emb(position_ids)
+                        except Exception:
+                            pass
+                    
+                    if cos is not None and sin is not None:
+                        # Device kontrolü
                         if cos.device != input_ids.device:
                             cos = cos.to(input_ids.device)
                         if sin.device != input_ids.device:
                             sin = sin.to(input_ids.device)
-                        
                         position_embeddings = (cos, sin)
                     else:
-                        position_embeddings = None
-                except Exception as e:
-                    print(f"⚠️  Rotary embeddings çağrısı başarısız: {e}")
-                    print(f"   Rotary emb tipi: {type(self._rotary_emb)}")
-                    print(f"   Rotary emb attributes: {dir(self._rotary_emb)[:10]}")
-                    position_embeddings = None
+                        print("⚠️  Rotary embeddings hesaplanamadı — tüm yöntemler başarısız")
+                else:
+                    print("⚠️  Rotary embedding bulunamadı (ne _rotary_emb ne de katmanlarda)")
             except Exception as e:
                 print(f"⚠️  Position embeddings hesaplanamadı: {e}")
                 import traceback
                 traceback.print_exc()
-                position_embeddings = None
 
         # NO-SHARDING MODU: Router'ı atla, tüm katmanları tek blokta çalıştır
         if self.no_sharding:

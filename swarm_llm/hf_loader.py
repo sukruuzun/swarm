@@ -588,8 +588,12 @@ class HuggingFaceBlockLoader(nn.Module):
         # Final norm yükle (eğer varsa)
         if config.get('has_final_norm', False):
             if router_data.get('final_norm_state_dict'):
-                # Final norm oluştur (embed_dim'e göre)
-                final_norm = nn.LayerNorm(embed_dim)
+                # Diskteki ağırlıklara bakalım: Bias var mı?
+                # Qwen ve bazı yeni Llama modelleri bias'sız LayerNorm kullanır
+                has_bias = 'bias' in router_data['final_norm_state_dict']
+                
+                # LayerNorm'u diskteki yapıya göre oluştur
+                final_norm = nn.LayerNorm(embed_dim, bias=has_bias)
                 final_norm.load_state_dict(router_data['final_norm_state_dict'])
                 final_norm.to(device_obj)
         

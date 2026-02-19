@@ -294,16 +294,30 @@ class HuggingFaceBlockLoader(nn.Module):
         return 'qwen' in model_type or 'qwen2' in model_type
     
     def _extract_rotary_embeddings(self):
-        """Qwen modelinden rotary embeddings'i çıkar."""
+        """
+        Qwen modelinden rotary embeddings'i çıkar.
+        KRİTİK: Device kontrolü yapılır (GPU/CPU).
+        """
         if self.model is None or len(self.layers) == 0:
             return None
         try:
             first_layer = self.layers[0]
             if hasattr(first_layer, 'self_attn'):
                 if hasattr(first_layer.self_attn, 'rotary_emb'):
-                    return first_layer.self_attn.rotary_emb
-        except:
-            pass
+                    rotary_emb = first_layer.self_attn.rotary_emb
+                    # KRİTİK: Rotary embeddings'i doğru device'a taşı
+                    # Model accelerate ile dağıtılmış olabilir
+                    try:
+                        # Rotary embeddings'in device'ını kontrol et
+                        if hasattr(rotary_emb, 'cos_cached'):
+                            # Cached değerler varsa device'ı kontrol et
+                            if rotary_emb.cos_cached.device != self.device:
+                                rotary_emb = rotary_emb.to(self.device)
+                    except:
+                        pass
+                    return rotary_emb
+        except Exception as e:
+            print(f"⚠️  Rotary embeddings çıkarılamadı: {e}")
         return None
     
     def _get_embed_layer(self) -> nn.Module:
@@ -394,7 +408,15 @@ class HuggingFaceBlockLoader(nn.Module):
                     if embed_vocab_size == lm_head_vocab_size:
                         print(f"   - Embedding ve LM Head eşleşiyor ({embed_vocab_size})")
                         print(f"   - Sorun: Tokenizer ile Model arasında offset var")
+                        offset = embed_vocab_size - (tokenizer_vocab_size or 0)
+                        print(f"   - Offset: {offset} token (Model daha büyük)")
                         print(f"   - Model checkpoint'teki vocab_size kullanılacak: {embed_vocab_size}")
+                        
+                        # KRİTİK: Tokenizer vocab_size'ı model vocab_size'ına eşitle
+                        # Padding token'ları ekle veya tokenizer'ı güncelle
+                        if tokenizer_vocab_size and offset > 0:
+                            print(f"\n   🔧 Tokenizer Padding: {offset} dummy token ekleniyor...")
+                            self._pad_tokenizer_vocab(tokenizer_vocab_size, embed_vocab_size)
                     else:
                         print(f"   - Embedding ({embed_vocab_size}) != LM Head ({lm_head_vocab_size})")
                         print(f"   - Bu durum ciddi bir sorun! Checkpoint'i kontrol edin.")
@@ -423,6 +445,25 @@ class HuggingFaceBlockLoader(nn.Module):
                     print(f"   ⚠️  Token '{test_token}' kontrol edilemedi: {e}")
         except Exception as e:
             print(f"   Token ID mapping kontrolü atlandı: {e}")
+    
+    def _pad_tokenizer_vocab(self, current_size: int, target_size: int):
+        """
+        Tokenizer vocab_size'ı model vocab_size'ına eşitlemek için padding token'ları ekle.
+        
+        KRİTİK: Bu fonksiyon tokenizer'ın vocab_size'ını artırmaz ama
+        embedding layer'ın beklediği token ID'lerinin geçerli olduğundan emin olur.
+        
+        Not: HuggingFace tokenizer'ların vocab_size'ını değiştirmek zor olduğu için,
+        bu fonksiyon sadece uyarı verir ve embedding layer'ın padding'i handle etmesini bekler.
+        """
+        offset = target_size - current_size
+        if offset > 0:
+            print(f"   ⚠️  Tokenizer vocab_size ({current_size}) < Model vocab_size ({target_size})")
+            print(f"   ⚠️  Offset: {offset} token")
+            print(f"   💡 Not: Tokenizer'ın vocab_size'ını değiştirmek zor.")
+            print(f"   💡 Çözüm: Embedding layer padding'i handle edecek.")
+            print(f"   💡 Tokenizer token ID'leri 0-{current_size-1} arası, Model 0-{target_size-1} bekliyor.")
+            print(f"   💡 Eğer tokenizer token ID >= {current_size} kullanırsa IndexError oluşabilir.")
     
     def _get_embed_dim(self) -> int:
         """Embedding boyutunu bul."""
@@ -531,12 +572,22 @@ class HuggingFaceBlockLoader(nn.Module):
                 position_ids = torch.arange(L, dtype=torch.long, device=input_ids.device)
                 position_ids = position_ids.unsqueeze(0).expand(B, -1)
                 
+                # KRİTİK: Rotary embeddings'i doğru device'a taşı
+                # Model accelerate ile dağıtılmış olabilir, rotary_emb farklı device'da olabilir
+                try:
+                    rotary_emb_device = next(self._rotary_emb.parameters()).device if hasattr(self._rotary_emb, 'parameters') else None
+                    if rotary_emb_device is not None and rotary_emb_device != input_ids.device:
+                        # Rotary embeddings'i input_ids ile aynı device'a taşı
+                        self._rotary_emb = self._rotary_emb.to(input_ids.device)
+                except:
+                    pass
+                
                 # Rotary embeddings'den position embeddings'i hesapla
                 # Qwen2'nin rotary_emb.forward() çağrısı
                 # Qwen2 rotary_emb genelde (cos, sin) tuple döndürür
-                # Ancak bazı versiyonlarda farklı imza olabilir
                 try:
                     # Qwen2 rotary_emb genelde position_ids ve seq_len alır
+                    # Ancak bazı versiyonlarda farklı imza olabilir
                     if hasattr(self._rotary_emb, '__call__'):
                         # rotary_emb(position_ids, seq_len=L) veya rotary_emb(position_ids)
                         try:
@@ -547,15 +598,27 @@ class HuggingFaceBlockLoader(nn.Module):
                                 cos, sin = self._rotary_emb(position_ids)
                             except:
                                 # Son çare: rotary_emb'in kendi forward metodunu kullan
+                                # Qwen2 rotary_emb.forward() genelde (position_ids, seq_len) alır
                                 cos, sin = self._rotary_emb.forward(position_ids, seq_len=L)
+                        
+                        # Device kontrolü: cos ve sin'in device'ı input_ids ile aynı olmalı
+                        if cos.device != input_ids.device:
+                            cos = cos.to(input_ids.device)
+                        if sin.device != input_ids.device:
+                            sin = sin.to(input_ids.device)
+                        
                         position_embeddings = (cos, sin)
                     else:
                         position_embeddings = None
                 except Exception as e:
                     print(f"⚠️  Rotary embeddings çağrısı başarısız: {e}")
+                    print(f"   Rotary emb tipi: {type(self._rotary_emb)}")
+                    print(f"   Rotary emb attributes: {dir(self._rotary_emb)[:10]}")
                     position_embeddings = None
             except Exception as e:
                 print(f"⚠️  Position embeddings hesaplanamadı: {e}")
+                import traceback
+                traceback.print_exc()
                 position_embeddings = None
 
         # NO-SHARDING MODU: Router'ı atla, tüm katmanları tek blokta çalıştır

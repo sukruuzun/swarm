@@ -233,6 +233,9 @@ class HuggingFaceBlockLoader(nn.Module):
         # Bu kontrol, karakter kayması (offset) hatalarını önler
         self._validate_vocab_alignment()
         
+        # KRİTİK: Embedding layer'a padding ekle (vocab size mismatch için)
+        self._pad_embedding_layer()
+        
         # Lazy loading için
         self._lazy_load = False
         self._block_paths = []
@@ -464,6 +467,44 @@ class HuggingFaceBlockLoader(nn.Module):
             print(f"   💡 Çözüm: Embedding layer padding'i handle edecek.")
             print(f"   💡 Tokenizer token ID'leri 0-{current_size-1} arası, Model 0-{target_size-1} bekliyor.")
             print(f"   💡 Eğer tokenizer token ID >= {current_size} kullanırsa IndexError oluşabilir.")
+    
+    def _pad_embedding_layer(self):
+        """
+        Embedding layer'a padding ekle (vocab size mismatch için).
+        
+        KRİTİK: Eğer tokenizer vocab_size < embedding vocab_size ise,
+        embedding layer'ın son token'ları kullanılmıyor olabilir.
+        Bu durumda embedding layer'ı tokenizer vocab_size'a göre clamp edebiliriz
+        veya padding token'ları ekleyebiliriz.
+        
+        Ancak şu an için sadece kontrol yapıyoruz, gerçek padding eklemiyoruz
+        çünkü model'in ağırlıklarını değiştirmek istemiyoruz.
+        """
+        if self.model is None:
+            return
+        
+        # Tokenizer vocab_size
+        tokenizer_vocab_size = None
+        if hasattr(self.tokenizer, 'vocab_size'):
+            tokenizer_vocab_size = self.tokenizer.vocab_size
+        elif hasattr(self.tokenizer, 'get_vocab'):
+            tokenizer_vocab_size = len(self.tokenizer.get_vocab())
+        
+        # Embedding vocab_size
+        embed_vocab_size = None
+        if hasattr(self.embed_layer, 'weight'):
+            embed_vocab_size = self.embed_layer.weight.shape[0]
+        
+        # Eğer tokenizer vocab_size < embedding vocab_size ise
+        if tokenizer_vocab_size and embed_vocab_size and tokenizer_vocab_size < embed_vocab_size:
+            offset = embed_vocab_size - tokenizer_vocab_size
+            print(f"\n💡 Embedding Padding Bilgisi:")
+            print(f"   - Tokenizer vocab_size: {tokenizer_vocab_size}")
+            print(f"   - Embedding vocab_size: {embed_vocab_size}")
+            print(f"   - Offset: {offset} token (embedding'in son {offset} token'ı kullanılmıyor)")
+            print(f"   - Tokenizer token ID'leri 0-{tokenizer_vocab_size-1} arası")
+            print(f"   - Model embedding 0-{embed_vocab_size-1} arası bekliyor")
+            print(f"   - Bu durum normal, model'in son token'ları padding için olabilir")
     
     def _get_embed_dim(self) -> int:
         """Embedding boyutunu bul."""
@@ -840,11 +881,29 @@ class HuggingFaceBlockLoader(nn.Module):
             # Son token'ın logits'ini al (tüm bağlam üzerinden)
             logits = outputs["logits"][:, -1, :] / temperature
 
+            # KRİTİK: Tokenizer vocab_size'dan büyük token ID'leri clamp et
+            # Model 152064 token bekliyor ama tokenizer sadece 151643 token biliyor
+            # Eğer model tokenizer'ın vocab_size'ından büyük bir ID üretirse, clamp et
+            tokenizer_vocab_size = None
+            if hasattr(self.tokenizer, 'vocab_size'):
+                tokenizer_vocab_size = self.tokenizer.vocab_size
+            elif hasattr(self.tokenizer, 'get_vocab'):
+                tokenizer_vocab_size = len(self.tokenizer.get_vocab())
+            
+            if tokenizer_vocab_size and logits.size(-1) > tokenizer_vocab_size:
+                # Logits'in son kısmını -inf yap (tokenizer'ın bilmediği token'lar)
+                logits[:, tokenizer_vocab_size:] = float("-inf")
+                print(f"   ⚠️  Token ID clamp: Logits {logits.size(-1)} → {tokenizer_vocab_size} (tokenizer vocab_size)")
+
             # Top-K sampling
             topk_vals, _ = torch.topk(logits, min(top_k, logits.size(-1)))
             logits[logits < topk_vals[:, -1:]] = float("-inf")
             probs = torch.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, 1)
+            
+            # KRİTİK: Üretilen token ID'sini tokenizer vocab_size'a clamp et
+            if tokenizer_vocab_size:
+                next_token = torch.clamp(next_token, 0, tokenizer_vocab_size - 1)
             
             # Yeni token'ı bağlama ekle (bir sonraki adım için)
             generated = torch.cat([generated, next_token], dim=1)

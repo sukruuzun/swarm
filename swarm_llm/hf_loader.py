@@ -1354,25 +1354,66 @@ class HuggingFaceBlockLoader(nn.Module):
         # ── ADIM 3: Router eğitimi ──
         print(f"\n🔧 Adım 3: Router eğitimi ({num_steps} adım)...")
         
+        # KESKİN hedef dağılım: En iyi 3 kombodan oluştur
+        # Softmax(−KL / temperature) ile keskin ağırlıklandır
+        kl_values = torch.tensor([kl for _, kl in sorted_combos], device=self.device)
+        sharp_weights = torch.nn.functional.softmax(-kl_values / 5.0, dim=0)  # temperature=5 → keskin
+        
         target_dist = torch.zeros(self.num_blocks, device=self.device)
-        for combo, kl in combo_scores.items():
-            score = 1.0 / (kl + 1e-6)
+        for (combo, _), weight in zip(sorted_combos, sharp_weights):
             for bi in combo:
-                target_dist[bi] += score
+                target_dist[bi] += weight.item()
         target_dist = target_dist / target_dist.sum()
         print(f"   Hedef dağılım: {[f'{t:.3f}' for t in target_dist.tolist()]}")
         
+        # Her prompt için en iyi komboyu bul → prompt-specific hedefler
+        prompt_targets = []
+        for p_idx, (x_embed, t_logits) in enumerate(teacher_data):
+            best_kl = float('inf')
+            best_combo_for_prompt = best_combo
+            for combo, kl_val in combo_scores.items():
+                # Bu prompt için KL'yi ayrı hesapla
+                with torch.no_grad():
+                    x_r = x_embed.clone()
+                    cs = set(combo)
+                    for bi in range(self.num_blocks):
+                        if bi in cs:
+                            block = self._load_block_from_disk(bi) if self._lazy_load else self.blocks[bi]
+                            x_r = self._run_single_block(block, x_r)
+                    s_log = self._get_logits(x_r)
+                    t_p = torch.nn.functional.softmax(t_logits.float(), dim=-1)
+                    s_lp = torch.nn.functional.log_softmax(s_log.float(), dim=-1)
+                    kl = torch.nn.functional.kl_div(s_lp, t_p, reduction='batchmean').item()
+                    if kl < best_kl:
+                        best_kl = kl
+                        best_combo_for_prompt = combo
+            
+            # Bu prompt için keskin hedef
+            pt = torch.zeros(self.num_blocks, device=self.device)
+            for bi in best_combo_for_prompt:
+                pt[bi] = 0.5  # Her seçilen blok %50
+            prompt_targets.append(pt)
+        
+        # Router'ı float32'ye al ve eğit
         original_dtype = next(self.router.parameters()).dtype
         if original_dtype != torch.float32:
             self.router = self.router.float()
         self.router.train()
-        optimizer = torch.optim.Adam(self.router.parameters(), lr=lr)
+        
+        # Yüksek lr + daha fazla adım
+        optimizer = torch.optim.Adam(self.router.parameters(), lr=lr * 3)
         
         for step in range(num_steps):
             total_loss = 0.0
-            for x_embed, _ in teacher_data:
+            for p_idx, (x_embed, _) in enumerate(teacher_data):
                 probs, _, aux_loss, _ = self.router(x_embed.float(), pool_input=True)
-                loss = torch.nn.functional.mse_loss(probs.squeeze(), target_dist) + 0.01 * aux_loss
+                probs_sq = probs.squeeze()
+                
+                # İki loss: global hedef + prompt-specific hedef
+                loss_global = torch.nn.functional.mse_loss(probs_sq, target_dist)
+                loss_prompt = torch.nn.functional.mse_loss(probs_sq, prompt_targets[p_idx])
+                loss = 0.3 * loss_global + 0.7 * loss_prompt + 0.001 * aux_loss
+                
                 total_loss += loss.item()
                 optimizer.zero_grad()
                 loss.backward()
@@ -1384,12 +1425,26 @@ class HuggingFaceBlockLoader(nn.Module):
         if original_dtype != torch.float32:
             self.router = self.router.to(dtype=original_dtype)
         
+        # Router temperature'ını düşür → daha keskin seçim
+        self.router.set_temperature(0.5)
+        
         # Sonuç
         print(f"\n✅ Kalibrasyon tamamlandı!")
         test_prompt = calibration_prompts[0]
         idxs, wts = self.predict_blocks(test_prompt, prefetch=False)
         print(f"   Router seçimi: {idxs} (en iyi: {list(best_combo)})")
-        print(f"   {'✅ Eşleşti!' if set(idxs) == set(best_combo) else '⚠️  Yakın ama tam eşleşmedi'}")
+        print(f"   Ağırlıklar: {[f'{w:.2%}' for w in wts.tolist()]}")
+        match = set(idxs) == set(best_combo)
+        print(f"   {'✅ Eşleşti!' if match else '⚠️  Yakın ama tam eşleşmedi'}")
+        
+        # Tüm promptlar için kontrol
+        match_count = 0
+        for p_idx, prompt in enumerate(calibration_prompts):
+            idxs_p, _ = self.predict_blocks(prompt, prefetch=False)
+            pt_best = [i for i, v in enumerate(prompt_targets[p_idx]) if v > 0]
+            if set(idxs_p) == set(pt_best):
+                match_count += 1
+        print(f"   Doğruluk: {match_count}/{len(calibration_prompts)} prompt eşleşti")
         print(f"{'='*60}\n")
     
     def _run_single_block(self, block, x):

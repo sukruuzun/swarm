@@ -179,7 +179,7 @@ def run_sharded_demo(model, tokenizer, num_blocks: int, top_k: int, prompt: str,
     
     # Router kalibrasyonu
     print(f"\n🎓 Router kalibrasyonu başlıyor...")
-    loader.calibrate_router(num_steps=50)
+    loader.calibrate_router(num_steps=200)
     
     # Kalibre edilmiş router ile blok tahmini
     block_indices2, weights2 = loader.predict_blocks(prompt, prefetch=False)

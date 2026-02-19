@@ -1056,7 +1056,7 @@ class HuggingFaceBlockLoader(nn.Module):
             # state_dict sadece sayıları kaydeder, modül yapısını kaybeder
             # torch.save(module) ise gerçek Qwen2DecoderLayer'ları korur
             # Böylece diskten yüklenince forward pass gerçek hesaplama yapar
-            block_cpu = block.cpu()  # CPU'ya taşı (GPU bellek boşalt)
+            block_cpu = block.cpu()
             torch.save(block_cpu, block_path)
             block.to(self.device)  # Geri GPU'ya taşı (sharding modu için)
             
@@ -1384,6 +1384,15 @@ class HuggingFaceBlockLoader(nn.Module):
         # KRİTİK: Gerçek modülü yükle (state_dict değil!)
         # torch.save(module) ile kaydedildi, torch.load ile gerçek Qwen2DecoderLayer geri gelir
         block = torch.load(block_path, map_location=self.device, weights_only=False)
+        
+        # KRİTİK: Dtype uyumu! block.cpu() float32'ye dönüştürür ama model float16.
+        # Embed layer'in dtype'ına cast et
+        try:
+            embed_dtype = next(self.embed_layer.parameters()).dtype
+            block = block.to(dtype=embed_dtype)
+        except (StopIteration, AttributeError):
+            pass
+        
         block.eval()
         
         # Cache'e ekle

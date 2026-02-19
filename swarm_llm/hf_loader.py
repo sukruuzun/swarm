@@ -1315,6 +1315,10 @@ class HuggingFaceBlockLoader(nn.Module):
         print(f"   Learning rate: {lr}")
         
         # Router'ı eğitim moduna al
+        # KRİTİK: Router float16 olabilir ama backward pass float32 ister
+        original_dtype = next(self.router.parameters()).dtype
+        if original_dtype != torch.float32:
+            self.router = self.router.float()  # Kalibrasyon için float32
         self.router.train()
         optimizer = torch.optim.Adam(self.router.parameters(), lr=lr)
         
@@ -1381,8 +1385,9 @@ class HuggingFaceBlockLoader(nn.Module):
             total_loss = 0.0
             
             for x_embed, target_contributions in block_contributions:
-                # Router'ın tahmin ettiği olasılıklar
-                probs, _, aux_loss, _ = self.router(x_embed, pool_input=True)
+                # Router'ın tahmin ettiği olasılıklar (float32)
+                x_f32 = x_embed.float()
+                probs, _, aux_loss, _ = self.router(x_f32, pool_input=True)
                 probs_squeezed = probs.squeeze()  # (num_blocks,)
                 
                 # Hedef: Router'ın olasılıkları gerçek katkılara yakınsın
@@ -1399,8 +1404,10 @@ class HuggingFaceBlockLoader(nn.Module):
                 avg_loss = total_loss / len(block_contributions)
                 print(f"   Adım {step+1}/{num_steps}: Loss = {avg_loss:.6f}")
         
-        # Router'ı eval moduna al
+        # Router'ı eval moduna al ve eski dtype'a geri dön
         self.router.eval()
+        if original_dtype != torch.float32:
+            self.router = self.router.to(dtype=original_dtype)
         
         # Sonuçları göster
         print(f"\n✅ Router kalibrasyonu tamamlandı!")

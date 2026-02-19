@@ -193,12 +193,14 @@ def run_sharded_demo(model, tokenizer, num_blocks: int, top_k: int, prompt: str,
 
 
 def run_lazy_loading_demo(tokenizer, save_dir: str, prompt: str):
-    """Lazy loading demo: Diskten yükleme."""
+    """Lazy loading demo: Diskten yükleme + sequential all blok çalıştırma."""
     from swarm_llm.hf_loader import HuggingFaceBlockLoader
     
     print("\n" + "="*70)
-    print("📂 LAZY LOADING MODU")
+    print("📂 LAZY LOADING MODU (Sequential All)")
     print("="*70)
+    print("   Tüm bloklar sırayla çalışır — NO-SHARDING kalitesi + VRAM tasarrufu")
+    print("   Her blok: diskten yükle → çalıştır → bellekten sil\n")
     
     if not os.path.exists(save_dir):
         print(f"⚠️  {save_dir} bulunamadı! Önce sharding modunu çalıştırın.")
@@ -209,6 +211,7 @@ def run_lazy_loading_demo(tokenizer, save_dir: str, prompt: str):
         save_dir=save_dir,
         lazy_load=True,
         device="auto",
+        sequential_all=True,  # Tüm bloklar sırayla çalışır (kaliteli)
     )
     
     # Prefetching başlat
@@ -218,13 +221,13 @@ def run_lazy_loading_demo(tokenizer, save_dir: str, prompt: str):
     print(f"   Bloklar diskte: {loader_lazy.num_blocks} blok")
     
     # Metin üretimi
-    print(f"\n🔄 Metin üretimi (lazy loading + sticky routing)...")
+    print(f"\n🔄 Metin üretimi (lazy loading + sequential all)...")
     generated = loader_lazy.generate(
         prompt=prompt,
-        max_new_tokens=100,
+        max_new_tokens=50,
         temperature=0.8,
         top_k=40,
-        prefetch_next=True,
+        prefetch_next=False,  # Sequential all'da prefetch'e gerek yok
     )
     
     print(f"\n📝 Üretilen metin:")

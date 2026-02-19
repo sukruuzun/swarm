@@ -749,6 +749,14 @@ class HuggingFaceBlockLoader(nn.Module):
             weights = torch.ones(1)
             probs = None
             aux_loss = None
+        # SEQUENTIAL LAZY MODU: Tüm blokları sırayla çalıştır (VRAM tasarrufu + kalite)
+        # Transformer katmanları sıralıdır — blok atlamak kalite kaybına neden olur
+        # Bu mod: yükle → çalıştır → bellekten sil — tüm bloklar çalışır ama sadece 1-2 bellekte
+        elif getattr(self, '_sequential_all', False):
+            selected_indices = list(range(self.num_blocks))
+            weights = torch.ones(self.num_blocks) / self.num_blocks
+            probs = None
+            aux_loss = None
         # STICKY ROUTING: Eğer sticky blocks varsa ve henüz süresi dolmamışsa, router'ı atla
         elif self._sticky_blocks is not None and current_token_idx is not None:
             if current_token_idx < self._sticky_until_token:
@@ -777,11 +785,11 @@ class HuggingFaceBlockLoader(nn.Module):
             selected_indices = indices[: self.top_k]
 
         # Sadece seçilen blokları sıralı çalıştır
-        # KRİTİK: HuggingFace katmanları tuple döndürür (hidden_states, past_key_values, ...)
-        # Defansif kodlama: Her adımda tuple kontrolü yap, sadece Tensor al
+        # KRİTİK: Transformer katmanları sıralı — blokları indeks sırasına göre çalıştır!
+        # Aksi halde Block 5 → Block 2 çalışır ki bu yanlıştır
         x_out = x
         
-        for idx in selected_indices:
+        for idx in sorted(selected_indices):
             # Lazy loading: Eğer blok diskte ise önce yükle
             if self._lazy_load:
                 # Prefetch cache'inde var mı kontrol et
@@ -1126,7 +1134,8 @@ class HuggingFaceBlockLoader(nn.Module):
         save_dir: str,
         device: str = "auto",
         lazy_load: bool = True,
-        sticky_duration: int = 25,  # Sticky routing: kaç token boyunca bloklar sabit kalır
+        sticky_duration: int = 25,
+        sequential_all: bool = True,  # True: tüm bloklar sırayla çalışır (kaliteli), False: router seçer (hızlı)
     ):
         """
         Diskten blokları yükleyerek loader oluştur (Lazy Loading).
@@ -1253,7 +1262,16 @@ class HuggingFaceBlockLoader(nn.Module):
         
         # Model tipi bilgisi (Qwen desteği için)
         loader._is_qwen = config.get('is_qwen', False)
-        loader.no_sharding = False  # Lazy loading'de no_sharding kullanılmaz
+        loader.no_sharding = False
+        loader.model = None  # Lazy loading'de model RAM'de değil
+        loader.layers = None  # Lazy loading'de layers yok
+        
+        # Sequential lazy mod: Tüm bloklar sırayla çalışır
+        # Router eğitimsizken bu mod ZORUNLU (aksi halde çöp çıktı)
+        loader._sequential_all = sequential_all
+        if sequential_all:
+            print(f"✅ Sequential lazy mod aktif: Tüm {config['num_blocks']} blok sırayla çalışacak")
+            print(f"   VRAM tasarrufu: Sadece 1-2 blok aynı anda bellekte")
         
         # Rotary embeddings'i diskten yükle (Qwen modelleri için KRİTİK)
         # Ayrı dosya olarak kaydedildi: rotary_emb.pt

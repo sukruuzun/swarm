@@ -55,3 +55,6 @@ Thumbs.db
 # Colab
 /content/
 /sample_data/
+
+# Colab demo with token (don't commit)
+colab_demo_hf.ipynb

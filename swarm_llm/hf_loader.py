@@ -596,20 +596,13 @@ class HuggingFaceBlockLoader(nn.Module):
             # PyTorch otomatik olarak doğru cihaza yönlendirir
             
             # KRİTİK: Qwen2 gibi modeller position_embeddings bekler
-            # Eğer position_embeddings varsa, katmanlara geçir
-            if position_embeddings is not None:
-                # Sequential içindeki TupleCleaner'lara position_embeddings geçirmek için
-                # Block'u doğrudan çağırmak yerine, içindeki katmanları tek tek çağırmalıyız
-                # Ama şimdilik basit çözüm: Block'a position_embeddings geçirmeyi dene
-                try:
-                    # Eğer block bir Sequential ise ve içindeki katmanlar position_embeddings kabul ediyorsa
-                    block_out = block(x_out)
-                except TypeError:
-                    # TypeError alırsak, position_embeddings'i geçirmeyi dene
-                    # Ancak Sequential içindeki katmanlara parametre geçirmek zor
-                    # Bu durumda block'u yeniden yapılandırmamız gerekebilir
-                    block_out = block(x_out)
+            # QwenBlockWrapper position_embeddings'i kabul eder
+            if isinstance(block, QwenBlockWrapper) and position_embeddings is not None:
+                block_out = block(x_out, position_embeddings=position_embeddings, 
+                                 position_ids=position_ids, 
+                                 attention_mask=attention_mask)
             else:
+                # Normal Sequential veya diğer modeller için
                 block_out = block(x_out)
             
             # DEFANSİF KODLAMA: Tuple kontrolü (HuggingFace standardı)

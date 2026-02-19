@@ -140,6 +140,10 @@ class HuggingFaceBlockLoader(nn.Module):
         self._lazy_load = False
         self._block_paths = []
         self._loaded_blocks = {}
+        
+        # Korumalı bloklar (thrashing'i önlemek için)
+        # Block 0 varsayılan olarak kilitli (en sık kullanılan blok)
+        self._locked_blocks = {0}  # Set: {0, 1, ...} manuel olarak kilitlenebilir
 
     def _extract_layers(self) -> nn.ModuleList:
         """
@@ -262,7 +266,7 @@ class HuggingFaceBlockLoader(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        use_cache: bool = False,
+        use_cache: bool = False,  # Zorunlu olarak False (KV Cache henüz desteklenmiyor)
     ) -> dict:
         """
         Forward pass: Sadece router'ın seçtiği bloklar çalışır.
@@ -270,11 +274,15 @@ class HuggingFaceBlockLoader(nn.Module):
         Args:
             input_ids: (B, L) token ids
             attention_mask: (B, L) attention mask (opsiyonel)
-            use_cache: KV cache kullan (opsiyonel)
+            use_cache: KV cache kullan (opsiyonel, şimdilik False zorunlu)
 
         Returns:
             logits, hidden_states, selected_indices, router_info
         """
+        # KRİTİK: KV Cache henüz desteklenmiyor (TupleCleaner past_key_values'i kaybediyor)
+        # Şimdilik use_cache=False zorunlu tutuyoruz
+        use_cache = False
+        
         self.eval()
         B, L = input_ids.shape
 
@@ -424,8 +432,8 @@ class HuggingFaceBlockLoader(nn.Module):
             first_indices, _ = self.predict_blocks(prompt, prefetch=True)
 
         for step in range(max_new_tokens):
-            # Forward (sadece seçilen bloklar)
-            outputs = self.forward(generated)
+            # Forward (sadece seçilen bloklar, use_cache=False zorunlu)
+            outputs = self.forward(generated, use_cache=False)
             logits = outputs["logits"][:, -1, :] / temperature
 
             # Top-K sampling
@@ -575,9 +583,9 @@ class HuggingFaceBlockLoader(nn.Module):
         # Tokenizer'dan vocab_size almak yerine, checkpoint'teki gerçek boyutu kullan
         embed_dim = config['embed_dim']
         embed_weight = router_data['embed_state_dict']['weight']
-        real_vocab_size = embed_weight.shape[0]  # Checkpoint'teki gerçek vocab_size (örn: 152064)
+        embed_vocab_size = embed_weight.shape[0]  # Checkpoint'teki gerçek vocab_size (örn: 152064)
         
-        embed_layer = nn.Embedding(real_vocab_size, embed_dim)
+        embed_layer = nn.Embedding(embed_vocab_size, embed_dim)
         embed_layer.load_state_dict(router_data['embed_state_dict'])
         embed_layer.to(device_obj)
         
@@ -602,6 +610,15 @@ class HuggingFaceBlockLoader(nn.Module):
             # LM head için de checkpoint'teki gerçek vocab_size'ı kullan
             lm_head_weight = router_data['lm_head_state_dict']['weight']
             lm_head_vocab_size = lm_head_weight.shape[0]  # Checkpoint'teki gerçek vocab_size
+            
+            # KRİTİK: Embedding ve LM Head vocab_size'larının eşleştiğinden emin ol
+            if embed_vocab_size != lm_head_vocab_size:
+                raise ValueError(
+                    f"Vocab size mismatch: Embedding={embed_vocab_size}, LM Head={lm_head_vocab_size}. "
+                    f"Bu durum çıktı karakter bozulmasına neden olur. "
+                    f"Checkpoint'i kontrol edin veya modeli yeniden kaydedin."
+                )
+            
             lm_head = nn.Linear(embed_dim, lm_head_vocab_size, bias=False)
             lm_head.load_state_dict(router_data['lm_head_state_dict'])
             lm_head.to(device_obj)
@@ -629,6 +646,10 @@ class HuggingFaceBlockLoader(nn.Module):
         loader._block_paths = []
         loader._loaded_blocks = {}  # Cache: {block_idx: nn.Module}
         loader._lazy_load = lazy_load
+        
+        # Korumalı bloklar (thrashing'i önlemek için)
+        # Block 0 varsayılan olarak kilitli (en sık kullanılan blok)
+        loader._locked_blocks = {0}  # Set: {0, 1, ...} manuel olarak kilitlenebilir
         
         # Asenkron prefetching için
         loader._prefetch_queue = Queue()
@@ -724,15 +745,42 @@ class HuggingFaceBlockLoader(nn.Module):
     def _unload_block_from_memory(self, block_idx: int):
         """
         RAM'den bir bloğu kaldır (bellek tasarrufu).
+        Korumalı bloklar (locked blocks) kaldırılmaz.
         
         Args:
             block_idx: Kaldırılacak blok indeksi
         """
+        # Korumalı blokları kontrol et (Block 0 varsayılan olarak kilitli)
+        if block_idx in self._locked_blocks:
+            print(f"🔒 Blok {block_idx} korumalı, RAM'den kaldırılmıyor")
+            return
+        
         if block_idx in self._loaded_blocks:
             del self._loaded_blocks[block_idx]
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             print(f"🗑️  Blok {block_idx} RAM'den kaldırıldı")
+    
+    def lock_block(self, block_idx: int):
+        """
+        Bir bloğu korumalı yap (RAM'den kaldırılmasını engelle).
+        
+        Args:
+            block_idx: Kilitlenecek blok indeksi
+        """
+        self._locked_blocks.add(block_idx)
+        print(f"🔒 Blok {block_idx} kilitlendi (RAM'den kaldırılmayacak)")
+    
+    def unlock_block(self, block_idx: int):
+        """
+        Bir bloğun kilidini kaldır (RAM'den kaldırılabilir hale getir).
+        
+        Args:
+            block_idx: Kilidi kaldırılacak blok indeksi
+        """
+        if block_idx in self._locked_blocks:
+            self._locked_blocks.remove(block_idx)
+            print(f"🔓 Blok {block_idx} kilidi kaldırıldı")
 
     def _prefetch_worker(self):
         """

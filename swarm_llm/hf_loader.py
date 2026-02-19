@@ -45,17 +45,44 @@ class QwenBlockWrapper(nn.Module):
         super().__init__()
         self.layers = nn.ModuleList(layers)
     
-    def forward(self, x, position_embeddings=None, position_ids=None, attention_mask=None):
+    def forward(self, x, position_embeddings=None, position_ids=None, 
+                attention_mask=None, past_key_value=None, use_cache=False):
         """
-        Qwen2 katmanlarını sırayla çalıştır, position_embeddings'i geçir.
+        Qwen2 katmanlarını sırayla çalıştır, KV cache destekli.
+        
+        past_key_value: dict veya list — her layer için (key, value) tuple'ları
+        use_cache: True ise KV cache'leri döndür
         """
-        for layer in self.layers:
+        all_present_kv = []
+        
+        for i, layer in enumerate(self.layers):
+            # Bu layer'ın KV cache'i
+            layer_past_kv = None
+            if past_key_value is not None:
+                if isinstance(past_key_value, (list, tuple)) and i < len(past_key_value):
+                    layer_past_kv = past_key_value[i]
+            
             if position_embeddings is not None:
-                x = layer(x, position_embeddings=position_embeddings, 
-                         position_ids=position_ids, 
-                         attention_mask=attention_mask)
+                out = layer(x, position_embeddings=position_embeddings, 
+                           position_ids=position_ids, 
+                           attention_mask=attention_mask,
+                           past_key_value=layer_past_kv,
+                           use_cache=use_cache)
             else:
-                x = layer(x)
+                out = layer(x)
+            
+            # Çıktıyı ayrıştır
+            if isinstance(out, tuple):
+                x = out[0]
+                if use_cache and len(out) > 1:
+                    all_present_kv.append(out[1])
+            else:
+                x = out
+                if use_cache:
+                    all_present_kv.append(None)
+        
+        if use_cache and all_present_kv:
+            return (x, all_present_kv)
         return x
 
 
@@ -604,25 +631,24 @@ class HuggingFaceBlockLoader(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        use_cache: bool = False,  # Zorunlu olarak False (KV Cache henüz desteklenmiyor)
-        current_token_idx: Optional[int] = None,  # Sticky routing için: şu anki token indeksi
+        use_cache: bool = False,
+        current_token_idx: Optional[int] = None,
+        **kwargs,
     ) -> dict:
         """
         Forward pass: Sadece router'ın seçtiği bloklar çalışır.
-        Sticky Routing: Eğer sticky blocks varsa, router'ı atla ve sabitlenmiş blokları kullan.
+        KV Cache desteği ile her yeni token sadece 1 token işler.
 
         Args:
             input_ids: (B, L) token ids
             attention_mask: (B, L) attention mask (opsiyonel)
-            use_cache: KV cache kullan (opsiyonel, şimdilik False zorunlu)
+            use_cache: KV cache kullan
             current_token_idx: Şu anki token indeksi (sticky routing için)
+            past_key_values: Önceki tokenlardan KV cache (kwargs içinde)
 
         Returns:
-            logits, hidden_states, selected_indices, router_info
+            logits, hidden_states, selected_indices, router_info, past_key_values
         """
-        # KRİTİK: KV Cache henüz desteklenmiyor (TupleCleaner past_key_values'i kaybediyor)
-        # Şimdilik use_cache=False zorunlu tutuyoruz
-        use_cache = False
         
         self.eval()
         B, L = input_ids.shape
@@ -758,6 +784,10 @@ class HuggingFaceBlockLoader(nn.Module):
         x_out = x
         selected_set = set(selected_indices)
         
+        # ── KV CACHE: past_key_values altyapısı ──
+        past_key_values = kwargs.get('past_key_values', None)
+        new_key_values = []
+        
         for idx in range(self.num_blocks):
             if idx in selected_set:
                 # ── SEÇİLEN BLOK: Full hesaplama ──
@@ -770,25 +800,40 @@ class HuggingFaceBlockLoader(nn.Module):
                 else:
                     block = self.blocks[idx]
                 
+                # ── KV CACHE: Bloka past_key_value geçir ──
+                block_past_kv = None
+                if past_key_values is not None and idx < len(past_key_values):
+                    block_past_kv = past_key_values[idx]
+                
                 if isinstance(block, QwenBlockWrapper) and position_embeddings is not None:
                     block_out = block(x_out, position_embeddings=position_embeddings, 
                                      position_ids=position_ids, 
-                                     attention_mask=attention_mask)
+                                     attention_mask=attention_mask,
+                                     past_key_value=block_past_kv,
+                                     use_cache=kwargs.get('use_cache', False))
                 else:
                     block_out = block(x_out)
                 
-                # DEFANSİF KODLAMA: Tuple kontrolü
+                # DEFANSİF KODLAMA: Tuple kontrolü + KV Cache çıkarma
                 if isinstance(block_out, tuple):
                     x_out = block_out[0]
+                    # KV Cache varsa kaydet (genelde tuple[1])
+                    if len(block_out) > 1 and block_out[1] is not None:
+                        new_key_values.append(block_out[1])
+                    else:
+                        new_key_values.append(None)
                 elif hasattr(block_out, 'last_hidden_state'):
                     x_out = block_out.last_hidden_state
+                    new_key_values.append(None)
                 elif isinstance(block_out, torch.Tensor):
                     x_out = block_out
+                    new_key_values.append(None)
                 else:
                     try:
                         x_out = block_out[0] if hasattr(block_out, '__getitem__') else block_out
                     except Exception:
                         x_out = block_out
+                    new_key_values.append(None)
                 
                 while isinstance(x_out, (tuple, list)) and len(x_out) > 0:
                     x_out = x_out[0]
@@ -797,7 +842,7 @@ class HuggingFaceBlockLoader(nn.Module):
                     raise TypeError(f"Blok {idx} çıktısı Tensor değil: {type(x_out)}")
             else:
                 # ── SEÇİLMEYEN BLOK: Identity (residual geçiş) ──
-                # x_out = x_out  →  Bloğun katkısı atlanır ama akış kopmaz
+                new_key_values.append(past_key_values[idx] if past_key_values and idx < len(past_key_values) else None)
                 pass
 
         # Final norm'dan önce tuple kontrolü
@@ -866,6 +911,7 @@ class HuggingFaceBlockLoader(nn.Module):
             "router_weights": weights_list,
             "router_info": self.router.get_stats(),
             "blocks_in_memory": list(self._loaded_blocks.keys()) if self._lazy_load else None,
+            "past_key_values": new_key_values if any(v is not None for v in new_key_values) else None,
         }
 
     @torch.no_grad()
@@ -902,15 +948,28 @@ class HuggingFaceBlockLoader(nn.Module):
         # STICKY ROUTING: İlk prompt için router çalışır ve blokları sabitler
         initial_prompt_len = generated.shape[1]
         
+        # ── KV CACHE: İlk forward tüm prompt'u işler, sonrakiler sadece yeni token ──
+        past_kv = None
+        
         for step in range(max_new_tokens):
             current_token_idx = initial_prompt_len + step
             
-            # Qwen2 gibi modern modeller causal masking'i kendi içinde halleder
-            # Dışarıdan attention_mask göndermek dtype uyumsuzluğuna neden olabilir
-            # (SDPA bool/float bekler, long gönderirsek RuntimeError)
+            # KV Cache varsa sadece son token'ı gönder (BÜYÜK HIZ KAZANCI)
+            if past_kv is not None:
+                input_for_forward = generated[:, -1:]
+            else:
+                input_for_forward = generated
             
-            # Her adımda TÜM bağlamı forward'a gönder (KV Cache olmadığı için)
-            outputs = self.forward(generated, attention_mask=None, use_cache=False, current_token_idx=current_token_idx)
+            outputs = self.forward(
+                input_for_forward, attention_mask=None, 
+                use_cache=True,  # KV Cache aktif!
+                current_token_idx=current_token_idx,
+                past_key_values=past_kv,
+            )
+            
+            # KV Cache'i güncelle
+            if outputs.get('past_key_values') is not None:
+                past_kv = outputs['past_key_values']
             
             # Eğer sticky blocks yoksa veya süresi dolduysa, yeni blokları sabitle
             # NO-SHARDING modunda sticky routing yok (zaten tek blok var)
@@ -1563,21 +1622,42 @@ class HuggingFaceBlockLoader(nn.Module):
         if block_idx >= len(self._block_paths):
             raise ValueError(f"Blok {block_idx} bulunamadı")
         
+        # ── BELLEK TEMİZLİĞİ: Önceki blokları sil ──
+        # Sequential modda sadece 1 blok bellekte olmalı
+        # MPS (18 GB) ve düşük VRAM GPU'larda kritik
+        blocks_to_remove = [idx for idx in self._loaded_blocks if idx != block_idx]
+        for idx in blocks_to_remove:
+            if idx not in self._locked_blocks:
+                del self._loaded_blocks[idx]
+        if blocks_to_remove:
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            # MPS için de bellek temizliği
+            if hasattr(torch, 'mps') and hasattr(torch.mps, 'empty_cache'):
+                torch.mps.empty_cache()
+        
         block_path = self._block_paths[block_idx]
         print(f"📂 Diskten yükleniyor: block_{block_idx}.pt")
         
-        # KRİTİK: Gerçek modülü yükle (state_dict değil!)
-        # torch.save(module) ile kaydedildi, torch.load ile gerçek Qwen2DecoderLayer geri gelir
-        block = torch.load(block_path, map_location=self.device, weights_only=False)
+        # KRİTİK: Önce CPU'ya yükle, cast et, sonra device'a taşı
+        # mmap=True ile dosya kopyalanmaz, doğrudan adreslenır (SSD I/O azalır)
+        try:
+            block = torch.load(block_path, map_location='cpu', weights_only=False, mmap=True)
+        except TypeError:
+            # PyTorch < 2.1: mmap desteklemiyor
+            block = torch.load(block_path, map_location='cpu', weights_only=False)
         
-        # KRİTİK: Dtype uyumu! block.cpu() float32'ye dönüştürür ama model float16.
-        # Embed layer'in dtype'ına cast et
+        # Dtype uyumu — CPU'da yap (GPU belleği kullanmaz)
         try:
             embed_dtype = next(self.embed_layer.parameters()).dtype
             block = block.to(dtype=embed_dtype)
         except (StopIteration, AttributeError):
             pass
         
+        # Şimdi device'a taşı (tek kopya, minimumum bellek)
+        block = block.to(self.device)
         block.eval()
         
         # Cache'e ekle

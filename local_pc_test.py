@@ -25,9 +25,14 @@ Kullanım:
        pip install torch transformers
 """
 
-import torch
 import os
 import sys
+
+# MPS (Apple Silicon) bellek limitini kaldır — torch'dan ONCE set edilmeli!
+# Unified memory olduğu için güvenli — sadece 1 blok (~1.8 GB) bellekte
+os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
+
+import torch
 
 # ── AYARLAR ──
 SAVE_DIR = "model_blocks_qwen25_7b"  # .pt dosyalarının olduğu klasör
@@ -90,7 +95,7 @@ print(f"   Prompt: '{PROMPT}'")
 
 generated = loader.generate(
     prompt=PROMPT,
-    max_new_tokens=80,
+    max_new_tokens=10,  # Her token ~1 dk disk I/O, 10 token = ~10 dk
     temperature=0.8,
     top_k=40,
 )

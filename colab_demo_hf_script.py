@@ -140,10 +140,10 @@ def run_sharded_demo(model, tokenizer, num_blocks: int, top_k: int, prompt: str,
     from swarm_llm.hf_loader import HuggingFaceBlockLoader
     
     print("\n" + "="*70)
-    print(f"🔧 SHARDING MODU: {num_blocks} blok, top_k={top_k}")
+    print(f"🔧 ARF-NASH HİBRİT MODU: {num_blocks} blok, top_k={top_k}")
     print("="*70)
     
-    # Bloklara böl
+    # Bloklara böl (HuggingFaceBlockLoader artık Arf imzalarını otomatik hesaplıyor)
     loader = HuggingFaceBlockLoader(
         model=model,
         tokenizer=tokenizer,
@@ -152,7 +152,8 @@ def run_sharded_demo(model, tokenizer, num_blocks: int, top_k: int, prompt: str,
         device="auto",
     )
     
-    print(f"✅ Model bloklara bölündü")
+    print(f"✅ Model Arf-Nash yapısıyla sharding yapıldı")
+    print(f"   🎨 Blok Kimlikleri (Arf Invariants) hesaplandı.")
     print(f"   Toplam layer: {len(loader.layers)}")
     print(f"   Blok sayısı: {loader.num_blocks}")
     print(f"   Her blok: {loader.layers_per_block} layer")
@@ -174,7 +175,8 @@ def run_sharded_demo(model, tokenizer, num_blocks: int, top_k: int, prompt: str,
     
     # Diske kaydet
     if save_dir:
-        print(f"\n💾 Bloklar diske kaydediliyor: {save_dir}")
+        os.makedirs(save_dir, exist_ok=True)
+        print(f"\n💾 Bloklar ve Arf İmzaları diske kaydediliyor: {save_dir}")
         loader.save_blocks_to_disk(save_dir)
         
         # ── HEMEN DRIVE'A KOPYALA (kalibrasyon çökmeden önce!) ──

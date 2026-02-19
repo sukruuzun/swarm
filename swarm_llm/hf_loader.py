@@ -47,8 +47,15 @@ class TupleCleaner(nn.Module):
         self.layer = layer
     
     def forward(self, x):
+        """
+        HuggingFace layer çıktısını temizle.
+        
+        KRİTİK NOT: Bu wrapper past_key_values (KV Cache) verisini kaybediyor.
+        Bu yüzden use_cache=False zorunlu tutuluyor. Her adımda tüm bağlam
+        yeniden işleniyor (KV Cache olmadan).
+        """
         out = self.layer(x)
-        # Tuple ise sadece hidden_states'i al
+        # Tuple ise sadece hidden_states'i al (past_key_values kaybolur)
         if isinstance(out, tuple):
             return out[0]
         return out
@@ -142,8 +149,13 @@ class HuggingFaceBlockLoader(nn.Module):
         self._loaded_blocks = {}
         
         # Korumalı bloklar (thrashing'i önlemek için)
-        # Block 0 varsayılan olarak kilitli (en sık kullanılan blok)
-        self._locked_blocks = {0}  # Set: {0, 1, ...} manuel olarak kilitlenebilir
+        # Block 0 ve Block 1 varsayılan olarak kilitli (en sık kullanılan bloklar)
+        # Block 0: Temel dil yapısı (alfabe, bağlaçlar)
+        # Block 1: İlk transformer katmanları (sık kullanılır)
+        self._locked_blocks = {0, 1}  # Set: {0, 1, ...} manuel olarak kilitlenebilir
+        
+        # Blok kullanım takibi (cleanup için)
+        self._block_usage_count = {}  # {block_idx: kullanım_sayısı}
 
     def _extract_layers(self) -> nn.ModuleList:
         """
@@ -384,14 +396,30 @@ class HuggingFaceBlockLoader(nn.Module):
             weights_cpu = weights_cpu.unsqueeze(0)
         weights_list = weights_cpu[: len(selected_indices)].tolist()
 
-        # Lazy loading: Kullanılmayan blokları RAM'den kaldır (opsiyonel)
-        # KRİTİK: Kilitli blokları (örn: Block 0) korumalı bloklar listesinden çıkar
-        if self._lazy_load and len(self._loaded_blocks) > self.top_k + len(self._locked_blocks):
+        # Blok kullanım takibini güncelle
+        for idx in selected_indices:
+            self._block_usage_count[idx] = self._block_usage_count.get(idx, 0) + 1
+        
+        # Lazy loading: Kullanılmayan blokları RAM'den kaldır (daha az agresif)
+        # KRİTİK: Sadece gerçekten uzun süre kullanılmayan blokları sil
+        # Thrashing'i önlemek için cleanup'ı daha az agresif yapıyoruz
+        if self._lazy_load and len(self._loaded_blocks) > (self.top_k * 2) + len(self._locked_blocks):
             # Kilitli blokları ve seçili blokları hariç tut
             unused_blocks = set(self._loaded_blocks.keys()) - set(selected_indices) - self._locked_blocks
-            # Sadece kilitli olmayan blokları kaldır
-            for unused_idx in list(unused_blocks):
+            
+            # En az kullanılan blokları bul (kullanım sayısına göre)
+            unused_with_counts = [
+                (idx, self._block_usage_count.get(idx, 0))
+                for idx in unused_blocks
+            ]
+            unused_with_counts.sort(key=lambda x: x[1])  # En az kullanılan önce
+            
+            # Sadece en az kullanılan birkaç bloğu kaldır (thrashing'i önlemek için)
+            blocks_to_remove = max(1, len(unused_blocks) - self.top_k)
+            for unused_idx, _ in unused_with_counts[:blocks_to_remove]:
                 self._unload_block_from_memory(unused_idx)
+                # Kullanım sayacını sıfırla (kaldırıldığı için)
+                self._block_usage_count.pop(unused_idx, None)
         
         return {
             "logits": logits,
@@ -434,8 +462,12 @@ class HuggingFaceBlockLoader(nn.Module):
             first_indices, _ = self.predict_blocks(prompt, prefetch=True)
 
         for step in range(max_new_tokens):
-            # Forward (sadece seçilen bloklar, use_cache=False zorunlu)
+            # KRİTİK: Her adımda TÜM bağlamı forward'a gönder (KV Cache olmadığı için)
+            # generated tüm token'ları içeriyor: [prompt + generated_tokens]
+            # use_cache=False olduğu için her adımda tüm bağlamı yeniden işliyoruz
             outputs = self.forward(generated, use_cache=False)
+            
+            # Son token'ın logits'ini al (tüm bağlam üzerinden)
             logits = outputs["logits"][:, -1, :] / temperature
 
             # Top-K sampling
@@ -443,6 +475,8 @@ class HuggingFaceBlockLoader(nn.Module):
             logits[logits < topk_vals[:, -1:]] = float("-inf")
             probs = torch.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, 1)
+            
+            # Yeni token'ı bağlama ekle (bir sonraki adım için)
             generated = torch.cat([generated, next_token], dim=1)
 
             # Bir sonraki adımın bloklarını prefetch et (asenkron)
@@ -650,8 +684,11 @@ class HuggingFaceBlockLoader(nn.Module):
         loader._lazy_load = lazy_load
         
         # Korumalı bloklar (thrashing'i önlemek için)
-        # Block 0 varsayılan olarak kilitli (en sık kullanılan blok)
-        loader._locked_blocks = {0}  # Set: {0, 1, ...} manuel olarak kilitlenebilir
+        # Block 0 ve Block 1 varsayılan olarak kilitli (en sık kullanılan bloklar)
+        loader._locked_blocks = {0, 1}  # Set: {0, 1, ...} manuel olarak kilitlenebilir
+        
+        # Blok kullanım takibi (cleanup için)
+        loader._block_usage_count = {}  # {block_idx: kullanım_sayısı}
         
         # Asenkron prefetching için
         loader._prefetch_queue = Queue()

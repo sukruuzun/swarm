@@ -1327,7 +1327,7 @@ class HuggingFaceBlockLoader(nn.Module):
                 for bi in range(self.num_blocks):
                     block = self._load_block_from_disk(bi) if self._lazy_load else self.blocks[bi]
                     x_running = self._run_single_block(block, x_running)
-                t_logits = self.lm_head(self.final_norm(x_running) if self.final_norm else x_running)
+                t_logits = self._get_logits(x_running)
                 teacher_data.append((x, t_logits))
         print(f"   ✅ {len(calibration_prompts)} teacher logits hazır")
         
@@ -1343,7 +1343,7 @@ class HuggingFaceBlockLoader(nn.Module):
                     for bi in sorted(combo):
                         block = self._load_block_from_disk(bi) if self._lazy_load else self.blocks[bi]
                         x_running = self._run_single_block(block, x_running)
-                    s_logits = self.lm_head(self.final_norm(x_running) if self.final_norm else x_running)
+                    s_logits = self._get_logits(x_running)
                     t_p = torch.nn.functional.softmax(t_logits.float(), dim=-1)
                     s_lp = torch.nn.functional.log_softmax(s_logits.float(), dim=-1)
                     kl = torch.nn.functional.kl_div(s_lp, t_p, reduction='batchmean')
@@ -1418,6 +1418,27 @@ class HuggingFaceBlockLoader(nn.Module):
         else:
             out = block(x)
         return out[0] if isinstance(out, tuple) else out
+    
+    def _get_logits(self, hidden_states):
+        """Hidden states'ten logits hesapla (final_norm + lm_head)."""
+        # Final norm
+        if self.model is not None:
+            if hasattr(self.model, "model") and hasattr(self.model.model, "norm"):
+                x = self.model.model.norm(hidden_states)
+            else:
+                x = hidden_states
+            # LM head
+            if hasattr(self.model, "lm_head"):
+                return self.model.lm_head(x)
+        else:
+            # Lazy loading
+            if self._final_norm is not None:
+                x = self._final_norm(hidden_states)
+            else:
+                x = hidden_states
+            if self._lm_head is not None:
+                return self._lm_head(x)
+        return None
 
     def _load_block_from_disk(self, block_idx: int) -> nn.Module:
         """

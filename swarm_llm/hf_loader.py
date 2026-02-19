@@ -93,8 +93,22 @@ class HuggingFaceBlockLoader(nn.Module):
         else:
             self.device = torch.device(device)
 
-        # Model'i cihaza taşı
-        self.model.to(self.device)
+        # Model'i cihaza taşı (accelerate ile dağıtılmış modeller için kontrol)
+        # device_map="auto" kullanıldığında model zaten GPU/CPU'ya dağıtılmıştır
+        # ve tekrar taşınmaya çalışılamaz
+        if hasattr(self.model, "hf_device_map") or hasattr(self.model, "device_map"):
+            # Model zaten accelerate ile dağıtılmış, taşıma
+            # Ana cihazı ilk parametrenin device'ından al
+            try:
+                first_param = next(self.model.parameters())
+                self.device = first_param.device
+                print(f"ℹ️  Model zaten {self.device} üzerinde dağıtılmış durumda (accelerate).")
+            except:
+                # Parametre bulunamazsa varsayılan cihazı kullan
+                pass
+        else:
+            # Model henüz dağıtılmamış (GPT-2 gibi küçük modeller), taşı
+            self.model.to(self.device)
 
         # Layer'ları bul (Llama/Qwen için genelde model.layers veya model.model.layers)
         self.layers = self._extract_layers()
@@ -258,6 +272,8 @@ class HuggingFaceBlockLoader(nn.Module):
                 block = self.blocks[idx]
             
             # Blok çıktısını al
+            # Not: Accelerate ile dağıtılmış modellerde blok farklı cihazda olabilir
+            # PyTorch otomatik olarak doğru cihaza yönlendirir
             block_out = block(x_out)
             
             # DEFANSİF KODLAMA: Tuple kontrolü (HuggingFace standardı)
@@ -610,7 +626,13 @@ class HuggingFaceBlockLoader(nn.Module):
         block_path = self._block_paths[block_idx]
         print(f"📂 Diskten yükleniyor: block_{block_idx}.pt")
         
-        block_data = torch.load(block_path, map_location=self.device)
+        # Accelerate ile dağıtılmış modeller için device mapping'i koru
+        # map_location yerine doğru cihazı kullan
+        try:
+            block_data = torch.load(block_path, map_location=self.device)
+        except:
+            # Fallback: CPU'ya yükle, sonra taşı
+            block_data = torch.load(block_path, map_location='cpu')
         
         # Blok yapısını yeniden oluştur
         # Blok yapısı kaydedilmişse kullan, yoksa state_dict'ten çıkar

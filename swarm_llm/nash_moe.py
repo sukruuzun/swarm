@@ -33,6 +33,8 @@ Matematiksel Formülasyon:
 """
 
 import math
+from typing import List, Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -130,8 +132,8 @@ class NashRouter(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        expert_outputs: list[torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        expert_outputs: Optional[List[torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """
         Nash routing.
 
@@ -203,7 +205,7 @@ class NashRouter(nn.Module):
         self,
         x: torch.Tensor,
         router_probs: torch.Tensor,
-        expert_outputs: list[torch.Tensor],
+        expert_outputs: List[torch.Tensor],
         chosen_indices: torch.Tensor,
     ):
         """

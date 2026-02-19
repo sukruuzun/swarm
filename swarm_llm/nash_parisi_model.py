@@ -32,6 +32,8 @@ Karşılaştırma:
 """
 
 import math
+from typing import Dict, Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -175,8 +177,8 @@ class NashParisiLLM(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        targets: torch.Tensor | None = None,
-        past_kvs: list | None = None,
+        targets: Optional[torch.Tensor] = None,
+        past_kvs: Optional[list] = None,
     ) -> dict:
         """
         İleri geçiş.
@@ -222,7 +224,7 @@ class NashParisiLLM(nn.Module):
             'moe_info': all_moe_info,
         }
 
-    def count_parameters(self) -> dict[str, int]:
+    def count_parameters(self) -> Dict[str, int]:
         total = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         embedding = sum(p.numel() for p in self.tok_emb.parameters())
@@ -264,7 +266,7 @@ class NashParisiLLM(nn.Module):
             stats['regrets'].append(info['regret'].tolist())
         return stats
 
-    def estimate_vram(self, seq_len: int, batch_size: int = 1) -> dict[str, str]:
+    def estimate_vram(self, seq_len: int, batch_size: int = 1) -> Dict[str, str]:
         """Standart vs Swarm vs Nash-Parisi VRAM karşılaştırması."""
         d = self.config.embed_dim
         h = self.config.num_heads

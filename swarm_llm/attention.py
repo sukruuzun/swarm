@@ -14,6 +14,8 @@ Temel Prensipler:
 """
 
 import math
+from typing import List, Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -98,7 +100,7 @@ class StarlingAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
 
         # Maske önbelleği (aynı seq_len için tekrar hesaplamamak adına)
-        self._cached_mask: torch.Tensor | None = None
+        self._cached_mask: Optional[torch.Tensor] = None
         self._cached_len: int = 0
 
     def _get_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
@@ -152,8 +154,8 @@ class StarlingAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         İleri geçiş.
 
@@ -260,8 +262,8 @@ class MultiScaleStarlingAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        past_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
-    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        past_kv: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
         """
         Çoklu ölçekli dikkat.
 

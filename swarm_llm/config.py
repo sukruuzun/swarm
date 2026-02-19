@@ -5,6 +5,7 @@ Parisi'nin sığırcık sürüsü modelinden esinlenen tüm hiperparametreler.
 """
 
 from dataclasses import dataclass
+from typing import List
 
 
 @dataclass
@@ -54,7 +55,7 @@ class SwarmConfig:
         return self.embed_dim // self.num_heads
 
     @property
-    def multi_scale_windows(self) -> list[int]:
+    def multi_scale_windows(self) -> List[int]:
         """Çoklu ölçekli pencere boyutları: yerel, orta, geniş."""
         if self.use_multi_scale:
             return [

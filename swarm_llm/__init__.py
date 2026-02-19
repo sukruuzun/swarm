@@ -14,8 +14,11 @@ from swarm_llm.model import SwarmLLM
 from swarm_llm.nash_moe import NashMoE, NashRouter
 from swarm_llm.nash_parisi_model import NashParisiLLM
 from swarm_llm.unified import UnifiedParisiNashLLM, UnifiedParisiNashAttention
+from swarm_llm.external_router import ExternalParisiNashRouter
+from swarm_llm.sparse_loader import SparseBlockLoader
+from swarm_llm.hf_loader import HuggingFaceBlockLoader
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = [
     "SwarmConfig",
@@ -27,4 +30,7 @@ __all__ = [
     "NashParisiLLM",
     "UnifiedParisiNashLLM",
     "UnifiedParisiNashAttention",
+    "ExternalParisiNashRouter",
+    "SparseBlockLoader",
+    "HuggingFaceBlockLoader",
 ]

@@ -27,6 +27,8 @@ GPU Bellek Tasarrufu:
 """
 
 import math
+from typing import Dict, List, Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -240,9 +242,9 @@ class SwarmLLM(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        targets: torch.Tensor | None = None,
-        past_kvs: list | None = None,
-    ) -> dict[str, torch.Tensor]:
+        targets: Optional[torch.Tensor] = None,
+        past_kvs: Optional[list] = None,
+    ) -> Dict[str, torch.Tensor]:
         """
         İleri geçiş.
 
@@ -383,7 +385,7 @@ class SwarmLLM(nn.Module):
 
         return generated
 
-    def count_parameters(self) -> dict[str, int]:
+    def count_parameters(self) -> Dict[str, int]:
         """Model parametre sayılarını döndürür."""
         total = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -402,7 +404,7 @@ class SwarmLLM(nn.Module):
             'other': total - embedding - attention,
         }
 
-    def estimate_vram(self, seq_len: int, batch_size: int = 1) -> dict[str, str]:
+    def estimate_vram(self, seq_len: int, batch_size: int = 1) -> Dict[str, str]:
         """
         Tahmini VRAM kullanımını hesaplar.
 

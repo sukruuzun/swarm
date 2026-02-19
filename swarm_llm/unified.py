@@ -25,6 +25,8 @@ Evrim:
 """
 
 import math
+from typing import Dict, Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -370,7 +372,7 @@ class UnifiedParisiNashLLM(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        targets: torch.Tensor | None = None,
+        targets: Optional[torch.Tensor] = None,
     ) -> dict:
         B, L = input_ids.shape
         x = self.tok_emb(input_ids)
@@ -405,7 +407,7 @@ class UnifiedParisiNashLLM(nn.Module):
             'moe_info': all_info,
         }
 
-    def count_parameters(self) -> dict[str, int]:
+    def count_parameters(self) -> Dict[str, int]:
         total = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         embedding = sum(p.numel() for p in self.tok_emb.parameters())

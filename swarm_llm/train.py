@@ -7,7 +7,7 @@ dağıtık eğitim yardımcıları.
 
 import math
 import time
-from typing import Iterator
+from typing import Iterator, List, Optional
 
 import torch
 import torch.nn as nn
@@ -112,7 +112,7 @@ class SwarmTrainer:
         model: SwarmLLM,
         config: SwarmConfig,
         train_dataset: Dataset,
-        val_dataset: Dataset | None = None,
+        val_dataset: Optional[Dataset] = None,
         gradient_accumulation_steps: int = 4,
         max_grad_norm: float = 1.0,
         eval_interval: int = 500,
@@ -184,7 +184,7 @@ class SwarmTrainer:
         self.model.train()
         return total_loss / max(num_batches, 1)
 
-    def train(self) -> list[dict]:
+    def train(self) -> List[dict]:
         """
         Ana eğitim döngüsü.
 

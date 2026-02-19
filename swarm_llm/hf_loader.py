@@ -99,39 +99,27 @@ class TupleCleaner(nn.Module):
         super().__init__()
         self.layer = layer
     
-    def forward(self, x, position_embeddings=None, attention_mask=None, position_ids=None, **kwargs):
+    def forward(self, x, position_embeddings=None, attention_mask=None, 
+                position_ids=None, past_key_value=None, use_cache=False, **kwargs):
         """
-        HuggingFace layer çıktısını temizle.
-        
-        KRİTİK NOT: 
-        - Bu wrapper past_key_values (KV Cache) verisini kaybediyor.
-        - Qwen2 gibi modeller position_embeddings bekler (RoPE için).
-        - Bu parametreler katmana geçirilir ama çıktıda sadece hidden_states döndürülür.
-        
-        Args:
-            x: hidden_states (Tensor)
-            position_embeddings: RoPE için position embeddings (Qwen2 için gerekli)
-            attention_mask: Attention mask
-            position_ids: Position IDs
-            **kwargs: Diğer parametreler (use_cache, vb.)
+        HuggingFace layer çıktısını temizle + KV Cache desteği.
         """
-        # Qwen2 katmanları position_embeddings bekler
-        # Eğer verilmişse geçir, yoksa sadece x'i geçir (eski modeller için)
         if position_embeddings is not None:
             out = self.layer(
                 x,
                 position_embeddings=position_embeddings,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                use_cache=False,  # KV Cache kullanmıyoruz
-                **kwargs
+                past_key_value=past_key_value,
+                use_cache=use_cache,
             )
         else:
-            # Eski modeller için (GPT-2, Llama-1, vb.)
-            out = self.layer(x, **kwargs)
+            out = self.layer(x, use_cache=use_cache)
         
-        # Tuple ise sadece hidden_states'i al (past_key_values kaybolur)
+        # Tuple: (hidden_states, present_key_value, ...)
         if isinstance(out, tuple):
+            if use_cache and len(out) > 1:
+                return (out[0], out[1])  # hidden_states + KV cache
             return out[0]
         return out
 

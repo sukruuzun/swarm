@@ -202,17 +202,21 @@ class HuggingFaceBlockLoader(nn.Module):
             indices = [indices]
 
         # Sadece seçilen blokları sıralı çalıştır
-        # Not: Transformer blokları tuple veya BaseModelOutput döndürebilir
+        # KRİTİK: HuggingFace katmanları tuple döndürür (hidden_states, past_key_values, ...)
+        # Defansif kodlama: Her adımda tuple kontrolü yap, sadece Tensor al
         x_out = x
         selected_indices = indices[: self.top_k]
         
         for idx in selected_indices:
+            # Blok çıktısını al
             block_out = self.blocks[idx](x_out)
             
-            # Tuple ise sadece ilk elemanı al (hidden_states)
+            # DEFANSİF KODLAMA: Tuple kontrolü (HuggingFace standardı)
+            # HuggingFace modelleri genelde (hidden_states, past_key_values, ...) döndürür
             if isinstance(block_out, tuple):
+                # Tuple ise sadece 0. indeksi al (hidden_states)
                 x_out = block_out[0]
-            # BaseModelOutput gibi objeler için
+            # BaseModelOutput veya benzeri objeler için
             elif hasattr(block_out, 'last_hidden_state'):
                 x_out = block_out.last_hidden_state
             elif hasattr(block_out, 'hidden_states') and block_out.hidden_states:
@@ -221,15 +225,22 @@ class HuggingFaceBlockLoader(nn.Module):
             elif isinstance(block_out, torch.Tensor):
                 x_out = block_out
             else:
-                # Fallback: ilk elemanı dene
+                # Son çare: ilk elemanı dene
                 try:
-                    x_out = block_out[0] if hasattr(block_out, '__getitem__') else block_out
+                    if hasattr(block_out, '__getitem__'):
+                        x_out = block_out[0]
+                    else:
+                        x_out = block_out
                 except:
                     x_out = block_out
             
-            # Güvenlik kontrolü: x_out hala tuple ise
-            if isinstance(x_out, tuple):
+            # ÇİFT KONTROL: x_out hala tuple/list ise (iç içe tuple durumu)
+            while isinstance(x_out, (tuple, list)) and len(x_out) > 0:
                 x_out = x_out[0]
+            
+            # Final güvenlik: Tensor olduğundan emin ol
+            if not isinstance(x_out, torch.Tensor):
+                raise TypeError(f"Blok {idx} çıktısı Tensor değil: {type(x_out)}")
 
         # Final norm'dan önce tuple kontrolü
         if isinstance(x_out, tuple):

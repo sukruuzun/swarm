@@ -79,6 +79,7 @@ class HuggingFaceBlockLoader(nn.Module):
         embed_dim: Optional[int] = None,
         device: str = "auto",
         sticky_duration: int = 25,  # Sticky routing: kaç token boyunca bloklar sabit kalır
+        no_sharding: bool = False,  # Test modu: Modeli hiç bölmeden tek blok olarak çalıştır
     ):
         """
         Args:
@@ -118,31 +119,61 @@ class HuggingFaceBlockLoader(nn.Module):
             # Model henüz dağıtılmamış (GPT-2 gibi küçük modeller), taşı
             self.model.to(self.device)
 
-        # Layer'ları bul (Llama/Qwen için genelde model.layers veya model.model.layers)
-        self.layers = self._extract_layers()
-        total_layers = len(self.layers)
+        # NO-SHARDING TEST MODU: Modeli hiç bölmeden tek blok olarak çalıştır
+        # Bu mod, sorunun sharding'den mi yoksa model yükleme/tokenizer'dan mı kaynaklandığını test eder
+        self.no_sharding = no_sharding
+        
+        if no_sharding:
+            # Tüm katmanları tek bir blok olarak kullan
+            print("⚠️  NO-SHARDING TEST MODU: Model hiç bölünmeden tek blok olarak çalışacak")
+            self.layers = self._extract_layers()
+            total_layers = len(self.layers)
+            self.num_blocks = 1
+            self.top_k = 1
+            self.layers_per_block = total_layers
+            # Tüm katmanları tek bir blokta topla
+            wrapped_layers = [TupleCleaner(layer) for layer in self.layers]
+            self.blocks = nn.ModuleList([nn.Sequential(*wrapped_layers)])
+            print(f"   Tüm {total_layers} katman tek blokta: Block 0")
+        else:
+            # Normal mod: Modeli bloklara böl
+            # Layer'ları bul (Llama/Qwen için genelde model.layers veya model.model.layers)
+            self.layers = self._extract_layers()
+            total_layers = len(self.layers)
 
-        if layers_per_block is None:
-            layers_per_block = max(1, total_layers // num_blocks)
-        self.layers_per_block = layers_per_block
+            if layers_per_block is None:
+                layers_per_block = max(1, total_layers // num_blocks)
+            self.layers_per_block = layers_per_block
 
-        # Blokları oluştur
-        self.blocks = self._create_blocks()
+            # Blokları oluştur
+            self.blocks = self._create_blocks()
 
         # Embedding boyutunu bul
         if embed_dim is None:
             embed_dim = self._get_embed_dim()
         self.embed_dim = embed_dim
 
-        # Router oluştur
-        self.router = ExternalParisiNashRouter(
-            embed_dim=embed_dim,
-            num_blocks=num_blocks,
-            top_k=top_k,
-        ).to(self.device)
+        # Router oluştur (no_sharding modunda router gerekli değil ama yine de oluştur)
+        if no_sharding:
+            # No-sharding modunda router kullanılmayacak ama yine de oluştur (API uyumluluğu için)
+            self.router = ExternalParisiNashRouter(
+                embed_dim=embed_dim,
+                num_blocks=1,
+                top_k=1,
+            ).to(self.device)
+        else:
+            self.router = ExternalParisiNashRouter(
+                embed_dim=embed_dim,
+                num_blocks=num_blocks,
+                top_k=top_k,
+            ).to(self.device)
 
         # Embedding layer'ı bul
         self.embed_layer = self._get_embed_layer()
+        
+        # KRİTİK: Tokenizer ve Model vocab_size kontrolü
+        # Bu kontrol, karakter kayması (offset) hatalarını önler
+        self._validate_vocab_alignment()
         
         # Lazy loading için
         self._lazy_load = False
@@ -225,6 +256,55 @@ class HuggingFaceBlockLoader(nn.Module):
                 "Lütfen model yapısını kontrol edin."
             )
 
+    def _validate_vocab_alignment(self):
+        """
+        Tokenizer ve Model vocab_size'larının eşleştiğini kontrol et.
+        Bu kontrol, karakter kayması (offset) hatalarını önler.
+        Örnek: Model 'A' demek isterken '焘' (Çince karakter) basması.
+        """
+        # Tokenizer vocab_size
+        tokenizer_vocab_size = None
+        if hasattr(self.tokenizer, 'vocab_size'):
+            tokenizer_vocab_size = self.tokenizer.vocab_size
+        elif hasattr(self.tokenizer, 'get_vocab'):
+            tokenizer_vocab_size = len(self.tokenizer.get_vocab())
+        
+        # Embedding vocab_size
+        embed_vocab_size = None
+        if hasattr(self.embed_layer, 'weight'):
+            embed_vocab_size = self.embed_layer.weight.shape[0]
+        
+        # LM Head vocab_size
+        lm_head_vocab_size = None
+        if self.model is not None:
+            if hasattr(self.model, 'lm_head') and hasattr(self.model.lm_head, 'weight'):
+                lm_head_vocab_size = self.model.lm_head.weight.shape[0]
+        
+        # Kontrol ve uyarı
+        vocab_sizes = {
+            'tokenizer': tokenizer_vocab_size,
+            'embedding': embed_vocab_size,
+            'lm_head': lm_head_vocab_size,
+        }
+        
+        # Tüm vocab_size'ları yazdır (debug için)
+        print(f"📊 Vocab Size Kontrolü:")
+        for name, size in vocab_sizes.items():
+            if size is not None:
+                print(f"   {name}: {size}")
+            else:
+                print(f"   {name}: Bulunamadı")
+        
+        # Eşleşme kontrolü
+        sizes = [v for v in vocab_sizes.values() if v is not None]
+        if len(sizes) > 1:
+            if len(set(sizes)) > 1:
+                print(f"⚠️  UYARI: Vocab size uyumsuzluğu tespit edildi!")
+                print(f"   Bu durum karakter kayması (offset) hatalarına neden olabilir.")
+                print(f"   Örnek: Model 'A' demek isterken '焘' (Çince karakter) basabilir.")
+            else:
+                print(f"✅ Vocab size'lar eşleşiyor: {sizes[0]}")
+    
     def _get_embed_dim(self) -> int:
         """Embedding boyutunu bul."""
         embed_layer = self._get_embed_layer()
@@ -313,8 +393,14 @@ class HuggingFaceBlockLoader(nn.Module):
         # Embedding
         x = self.embed_layer(input_ids)  # (B, L, D)
 
+        # NO-SHARDING MODU: Router'ı atla, tüm katmanları tek blokta çalıştır
+        if self.no_sharding:
+            selected_indices = [0]  # Tek blok: Block 0
+            weights = torch.ones(1)
+            probs = None
+            aux_loss = None
         # STICKY ROUTING: Eğer sticky blocks varsa ve henüz süresi dolmamışsa, router'ı atla
-        if self._sticky_blocks is not None and current_token_idx is not None:
+        elif self._sticky_blocks is not None and current_token_idx is not None:
             if current_token_idx < self._sticky_until_token:
                 # Sticky blocks'u kullan, router'ı çalıştırma
                 selected_indices = list(self._sticky_blocks)
@@ -507,7 +593,8 @@ class HuggingFaceBlockLoader(nn.Module):
             outputs = self.forward(generated, use_cache=False, current_token_idx=current_token_idx)
             
             # Eğer sticky blocks yoksa veya süresi dolduysa, yeni blokları sabitle
-            if self._sticky_blocks is None:
+            # NO-SHARDING modunda sticky routing yok (zaten tek blok var)
+            if not self.no_sharding and self._sticky_blocks is None:
                 selected_indices = outputs["selected_indices"]
                 self._sticky_blocks = set(selected_indices)
                 self._sticky_until_token = current_token_idx + self._sticky_duration
@@ -707,8 +794,24 @@ class HuggingFaceBlockLoader(nn.Module):
                 raise ValueError(
                     f"Vocab size mismatch: Embedding={embed_vocab_size}, LM Head={lm_head_vocab_size}. "
                     f"Bu durum çıktı karakter bozulmasına neden olur. "
+                    f"Örnek: Model 'A' demek isterken '焘' (Çince karakter) basabilir. "
                     f"Checkpoint'i kontrol edin veya modeli yeniden kaydedin."
                 )
+            
+            # Tokenizer vocab_size kontrolü (opsiyonel ama önerilir)
+            tokenizer_vocab_size = None
+            if hasattr(tokenizer, 'vocab_size'):
+                tokenizer_vocab_size = tokenizer.vocab_size
+            elif hasattr(tokenizer, 'get_vocab'):
+                tokenizer_vocab_size = len(tokenizer.get_vocab())
+            
+            if tokenizer_vocab_size is not None:
+                if embed_vocab_size != tokenizer_vocab_size:
+                    print(f"⚠️  UYARI: Tokenizer vocab_size ({tokenizer_vocab_size}) != Model vocab_size ({embed_vocab_size})")
+                    print(f"   Bu durum karakter kayması (offset) hatalarına neden olabilir.")
+                    print(f"   Model checkpoint'teki vocab_size kullanılacak ({embed_vocab_size}).")
+                else:
+                    print(f"✅ Tokenizer ve Model vocab_size eşleşiyor: {embed_vocab_size}")
             
             lm_head = nn.Linear(embed_dim, lm_head_vocab_size, bias=False)
             lm_head.load_state_dict(router_data['lm_head_state_dict'])

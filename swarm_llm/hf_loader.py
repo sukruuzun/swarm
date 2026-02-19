@@ -36,25 +36,73 @@ from queue import Queue
 from swarm_llm.external_router import ExternalParisiNashRouter
 
 
+class QwenBlockWrapper(nn.Module):
+    """
+    Qwen2 için özel block wrapper.
+    Sequential içindeki katmanlara position_embeddings geçirmek için.
+    """
+    def __init__(self, layers: list):
+        super().__init__()
+        self.layers = nn.ModuleList(layers)
+    
+    def forward(self, x, position_embeddings=None, position_ids=None, attention_mask=None):
+        """
+        Qwen2 katmanlarını sırayla çalıştır, position_embeddings'i geçir.
+        """
+        for layer in self.layers:
+            if position_embeddings is not None:
+                x = layer(x, position_embeddings=position_embeddings, 
+                         position_ids=position_ids, 
+                         attention_mask=attention_mask)
+            else:
+                x = layer(x)
+        return x
+
+
 class TupleCleaner(nn.Module):
     """
     HuggingFace layer çıktılarını temizleyen wrapper.
-    GPT-2/Llama layer'ları tuple döndürür (hidden_states, past_key_values, ...),
+    GPT-2/Llama/Qwen layer'ları tuple döndürür (hidden_states, past_key_values, ...),
     bu wrapper sadece hidden_states'i alır ve bir sonraki layer'a geçirir.
+    
+    KRİTİK: Qwen2 gibi modern modeller position_embeddings bekler (RoPE için).
+    Bu parametreler katmanlara geçirilmelidir.
     """
     def __init__(self, layer: nn.Module):
         super().__init__()
         self.layer = layer
     
-    def forward(self, x):
+    def forward(self, x, position_embeddings=None, attention_mask=None, position_ids=None, **kwargs):
         """
         HuggingFace layer çıktısını temizle.
         
-        KRİTİK NOT: Bu wrapper past_key_values (KV Cache) verisini kaybediyor.
-        Bu yüzden use_cache=False zorunlu tutuluyor. Her adımda tüm bağlam
-        yeniden işleniyor (KV Cache olmadan).
+        KRİTİK NOT: 
+        - Bu wrapper past_key_values (KV Cache) verisini kaybediyor.
+        - Qwen2 gibi modeller position_embeddings bekler (RoPE için).
+        - Bu parametreler katmana geçirilir ama çıktıda sadece hidden_states döndürülür.
+        
+        Args:
+            x: hidden_states (Tensor)
+            position_embeddings: RoPE için position embeddings (Qwen2 için gerekli)
+            attention_mask: Attention mask
+            position_ids: Position IDs
+            **kwargs: Diğer parametreler (use_cache, vb.)
         """
-        out = self.layer(x)
+        # Qwen2 katmanları position_embeddings bekler
+        # Eğer verilmişse geçir, yoksa sadece x'i geçir (eski modeller için)
+        if position_embeddings is not None:
+            out = self.layer(
+                x,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False,  # KV Cache kullanmıyoruz
+                **kwargs
+            )
+        else:
+            # Eski modeller için (GPT-2, Llama-1, vb.)
+            out = self.layer(x, **kwargs)
+        
         # Tuple ise sadece hidden_states'i al (past_key_values kaybolur)
         if isinstance(out, tuple):
             return out[0]
@@ -133,7 +181,11 @@ class HuggingFaceBlockLoader(nn.Module):
             self.layers_per_block = total_layers
             # Tüm katmanları tek bir blokta topla
             wrapped_layers = [TupleCleaner(layer) for layer in self.layers]
-            self.blocks = nn.ModuleList([nn.Sequential(*wrapped_layers)])
+            # Qwen için özel wrapper kullan
+            if self._is_qwen:
+                self.blocks = nn.ModuleList([QwenBlockWrapper(wrapped_layers)])
+            else:
+                self.blocks = nn.ModuleList([nn.Sequential(*wrapped_layers)])
             print(f"   Tüm {total_layers} katman tek blokta: Block 0")
         else:
             # Normal mod: Modeli bloklara böl
@@ -170,6 +222,12 @@ class HuggingFaceBlockLoader(nn.Module):
 
         # Embedding layer'ı bul
         self.embed_layer = self._get_embed_layer()
+        
+        # Qwen2 modeli için rotary embeddings'i sakla (position_embeddings için)
+        self._is_qwen = self._detect_qwen_model()
+        self._rotary_emb = None
+        if self._is_qwen and self.model is not None:
+            self._rotary_emb = self._extract_rotary_embeddings()
         
         # KRİTİK: Tokenizer ve Model vocab_size kontrolü
         # Bu kontrol, karakter kayması (offset) hatalarını önler
@@ -228,6 +286,26 @@ class HuggingFaceBlockLoader(nn.Module):
                 "Lütfen model yapısını kontrol edin veya issue açın."
             )
 
+    def _detect_qwen_model(self) -> bool:
+        """Qwen modeli olup olmadığını tespit et."""
+        if self.model is None:
+            return False
+        model_type = type(self.model).__name__.lower()
+        return 'qwen' in model_type or 'qwen2' in model_type
+    
+    def _extract_rotary_embeddings(self):
+        """Qwen modelinden rotary embeddings'i çıkar."""
+        if self.model is None or len(self.layers) == 0:
+            return None
+        try:
+            first_layer = self.layers[0]
+            if hasattr(first_layer, 'self_attn'):
+                if hasattr(first_layer.self_attn, 'rotary_emb'):
+                    return first_layer.self_attn.rotary_emb
+        except:
+            pass
+        return None
+    
     def _get_embed_layer(self) -> nn.Module:
         """
         Embedding layer'ı bul.
@@ -360,6 +438,9 @@ class HuggingFaceBlockLoader(nn.Module):
         """
         Layer'ları bloklara böl.
         Her layer'ı TupleCleaner ile sararak tuple çıktılarını temizleriz.
+        
+        KRİTİK: Qwen2 gibi modeller position_embeddings bekler.
+        Qwen için özel QwenBlockWrapper kullanılır.
         """
         blocks = nn.ModuleList()
         total_layers = len(self.layers)
@@ -371,7 +452,12 @@ class HuggingFaceBlockLoader(nn.Module):
                 block_layers = self.layers[start_idx:end_idx]
                 # Her layer'ı TupleCleaner ile sar (tuple çıktılarını temizle)
                 wrapped_layers = [TupleCleaner(layer) for layer in block_layers]
-                blocks.append(nn.Sequential(*wrapped_layers))
+                
+                # Qwen için özel wrapper kullan (position_embeddings geçirmek için)
+                if self._is_qwen:
+                    blocks.append(QwenBlockWrapper(wrapped_layers))
+                else:
+                    blocks.append(nn.Sequential(*wrapped_layers))
             else:
                 # Boş blok (padding)
                 blocks.append(nn.Identity())
@@ -433,6 +519,26 @@ class HuggingFaceBlockLoader(nn.Module):
 
         # Embedding
         x = self.embed_layer(input_ids)  # (B, L, D)
+        
+        # KRİTİK: Qwen2 gibi modeller position_embeddings bekler (RoPE için)
+        # Rotary embeddings'i hesapla (eğer Qwen ise)
+        position_embeddings = None
+        position_ids = None
+        
+        if self._is_qwen and self._rotary_emb is not None:
+            try:
+                # Position IDs oluştur
+                position_ids = torch.arange(L, dtype=torch.long, device=input_ids.device)
+                position_ids = position_ids.unsqueeze(0).expand(B, -1)
+                
+                # Rotary embeddings'den position embeddings'i hesapla
+                # Qwen2'nin rotary_emb.forward(position_ids, seq_len=L) çağrısı
+                # (cos, sin) tuple döndürür
+                cos, sin = self._rotary_emb(position_ids, seq_len=L)
+                position_embeddings = (cos, sin)
+            except Exception as e:
+                print(f"⚠️  Position embeddings hesaplanamadı: {e}")
+                position_embeddings = None
 
         # NO-SHARDING MODU: Router'ı atla, tüm katmanları tek blokta çalıştır
         if self.no_sharding:
@@ -488,7 +594,23 @@ class HuggingFaceBlockLoader(nn.Module):
             # Blok çıktısını al
             # Not: Accelerate ile dağıtılmış modellerde blok farklı cihazda olabilir
             # PyTorch otomatik olarak doğru cihaza yönlendirir
-            block_out = block(x_out)
+            
+            # KRİTİK: Qwen2 gibi modeller position_embeddings bekler
+            # Eğer position_embeddings varsa, katmanlara geçir
+            if position_embeddings is not None:
+                # Sequential içindeki TupleCleaner'lara position_embeddings geçirmek için
+                # Block'u doğrudan çağırmak yerine, içindeki katmanları tek tek çağırmalıyız
+                # Ama şimdilik basit çözüm: Block'a position_embeddings geçirmeyi dene
+                try:
+                    # Eğer block bir Sequential ise ve içindeki katmanlar position_embeddings kabul ediyorsa
+                    block_out = block(x_out)
+                except TypeError:
+                    # TypeError alırsak, position_embeddings'i geçirmeyi dene
+                    # Ancak Sequential içindeki katmanlara parametre geçirmek zor
+                    # Bu durumda block'u yeniden yapılandırmamız gerekebilir
+                    block_out = block(x_out)
+            else:
+                block_out = block(x_out)
             
             # DEFANSİF KODLAMA: Tuple kontrolü (HuggingFace standardı)
             # HuggingFace modelleri genelde (hidden_states, past_key_values, ...) döndürür

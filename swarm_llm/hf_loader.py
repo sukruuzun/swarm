@@ -34,6 +34,24 @@ from typing import List, Optional, Tuple
 from swarm_llm.external_router import ExternalParisiNashRouter
 
 
+class TupleCleaner(nn.Module):
+    """
+    HuggingFace layer çıktılarını temizleyen wrapper.
+    GPT-2/Llama layer'ları tuple döndürür (hidden_states, past_key_values, ...),
+    bu wrapper sadece hidden_states'i alır ve bir sonraki layer'a geçirir.
+    """
+    def __init__(self, layer: nn.Module):
+        super().__init__()
+        self.layer = layer
+    
+    def forward(self, x):
+        out = self.layer(x)
+        # Tuple ise sadece hidden_states'i al
+        if isinstance(out, tuple):
+            return out[0]
+        return out
+
+
 class HuggingFaceBlockLoader(nn.Module):
     """
     HuggingFace modelini bloklara bölen ve Parisi-Nash router ile
@@ -137,7 +155,10 @@ class HuggingFaceBlockLoader(nn.Module):
             return 4096  # Varsayılan (Llama-2-7b)
 
     def _create_blocks(self) -> nn.ModuleList:
-        """Layer'ları bloklara böl."""
+        """
+        Layer'ları bloklara böl.
+        Her layer'ı TupleCleaner ile sararak tuple çıktılarını temizleriz.
+        """
         blocks = nn.ModuleList()
         total_layers = len(self.layers)
 
@@ -146,7 +167,9 @@ class HuggingFaceBlockLoader(nn.Module):
             end_idx = min((i + 1) * self.layers_per_block, total_layers)
             if start_idx < total_layers:
                 block_layers = self.layers[start_idx:end_idx]
-                blocks.append(nn.Sequential(*block_layers))
+                # Her layer'ı TupleCleaner ile sar (tuple çıktılarını temizle)
+                wrapped_layers = [TupleCleaner(layer) for layer in block_layers]
+                blocks.append(nn.Sequential(*wrapped_layers))
             else:
                 # Boş blok (padding)
                 blocks.append(nn.Identity())

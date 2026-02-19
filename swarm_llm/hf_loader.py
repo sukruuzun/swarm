@@ -532,10 +532,28 @@ class HuggingFaceBlockLoader(nn.Module):
                 position_ids = position_ids.unsqueeze(0).expand(B, -1)
                 
                 # Rotary embeddings'den position embeddings'i hesapla
-                # Qwen2'nin rotary_emb.forward(position_ids, seq_len=L) çağrısı
-                # (cos, sin) tuple döndürür
-                cos, sin = self._rotary_emb(position_ids, seq_len=L)
-                position_embeddings = (cos, sin)
+                # Qwen2'nin rotary_emb.forward() çağrısı
+                # Qwen2 rotary_emb genelde (cos, sin) tuple döndürür
+                # Ancak bazı versiyonlarda farklı imza olabilir
+                try:
+                    # Qwen2 rotary_emb genelde position_ids ve seq_len alır
+                    if hasattr(self._rotary_emb, '__call__'):
+                        # rotary_emb(position_ids, seq_len=L) veya rotary_emb(position_ids)
+                        try:
+                            cos, sin = self._rotary_emb(position_ids, seq_len=L)
+                        except TypeError:
+                            # Farklı imza denemesi
+                            try:
+                                cos, sin = self._rotary_emb(position_ids)
+                            except:
+                                # Son çare: rotary_emb'in kendi forward metodunu kullan
+                                cos, sin = self._rotary_emb.forward(position_ids, seq_len=L)
+                        position_embeddings = (cos, sin)
+                    else:
+                        position_embeddings = None
+                except Exception as e:
+                    print(f"⚠️  Rotary embeddings çağrısı başarısız: {e}")
+                    position_embeddings = None
             except Exception as e:
                 print(f"⚠️  Position embeddings hesaplanamadı: {e}")
                 position_embeddings = None

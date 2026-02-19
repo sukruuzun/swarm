@@ -1051,35 +1051,18 @@ class HuggingFaceBlockLoader(nn.Module):
         
         for i, block in enumerate(self.blocks):
             block_path = os.path.join(save_dir, f"block_{i}.pt")
-            # Blok yapısını tam kaydet (lazy loading'de yeniden oluşturmak için)
-            block_structure = []
-            block_type = type(block).__name__  # QwenBlockWrapper veya Sequential
             
-            if isinstance(block, QwenBlockWrapper):
-                for j, layer in enumerate(block.layers):
-                    if isinstance(layer, TupleCleaner):
-                        inner_type = type(layer.layer).__name__
-                        block_structure.append(f"TupleCleaner({inner_type})")
-                    else:
-                        block_structure.append(type(layer).__name__)
-            elif isinstance(block, nn.Sequential):
-                for j, layer in enumerate(block):
-                    if isinstance(layer, TupleCleaner):
-                        inner_type = type(layer.layer).__name__
-                        block_structure.append(f"TupleCleaner({inner_type})")
-                    else:
-                        block_structure.append(type(layer).__name__)
+            # KRİTİK: Tam modülü kaydet (state_dict DEĞİL!)
+            # state_dict sadece sayıları kaydeder, modül yapısını kaybeder
+            # torch.save(module) ise gerçek Qwen2DecoderLayer'ları korur
+            # Böylece diskten yüklenince forward pass gerçek hesaplama yapar
+            block_cpu = block.cpu()  # CPU'ya taşı (GPU bellek boşalt)
+            torch.save(block_cpu, block_path)
+            block.to(self.device)  # Geri GPU'ya taşı (sharding modu için)
             
-            torch.save({
-                'state_dict': block.state_dict(),
-                'block_index': i,
-                'layers_per_block': self.layers_per_block,
-                'block_structure': block_structure,
-                'block_type': block_type,  # QwenBlockWrapper / Sequential
-                'num_layers_in_block': len(block_structure),
-            }, block_path)
+            num_layers = len(block.layers) if isinstance(block, QwenBlockWrapper) else len(list(block.children()))
             block_size_mb = os.path.getsize(block_path) / (1024**2)
-            print(f"   Blok {i}: {block_size_mb:.2f} MB ({len(block_structure)} layer) → {block_path}")
+            print(f"   Blok {i}: {block_size_mb:.2f} MB ({num_layers} layer) → {block_path}")
         
         # Final norm ve LM head'i de kaydet
         final_norm_state = None
@@ -1319,8 +1302,9 @@ class HuggingFaceBlockLoader(nn.Module):
             if lazy_load:
                 loader.blocks.append(nn.Identity())  # Placeholder
             else:
-                # Eager: hemen yükle (gerçek blok yapısını oluştur)
-                block = loader._rebuild_block_from_disk(block_path, device_obj)
+                # Eager: hemen yükle (gerçek modülü torch.load ile)
+                block = torch.load(block_path, map_location=device_obj, weights_only=False)
+                block.eval()
                 loader.blocks.append(block)
         
         loader.model = None
@@ -1380,12 +1364,13 @@ class HuggingFaceBlockLoader(nn.Module):
     def _load_block_from_disk(self, block_idx: int) -> nn.Module:
         """
         Diskten bir bloğu yükle (Lazy Loading) ve cache'e ekle.
+        KRİTİK: torch.load ile GERÇEK modül yüklenir (QwenBlockWrapper + Qwen2DecoderLayer)
         
         Args:
             block_idx: Yüklenecek blok indeksi
         
         Returns:
-            Yüklenmiş blok modülü
+            Yüklenmiş blok modülü (gerçek forward pass yapar)
         """
         if block_idx in self._loaded_blocks:
             return self._loaded_blocks[block_idx]
@@ -1396,7 +1381,10 @@ class HuggingFaceBlockLoader(nn.Module):
         block_path = self._block_paths[block_idx]
         print(f"📂 Diskten yükleniyor: block_{block_idx}.pt")
         
-        block = self._rebuild_block_from_disk(block_path, self.device)
+        # KRİTİK: Gerçek modülü yükle (state_dict değil!)
+        # torch.save(module) ile kaydedildi, torch.load ile gerçek Qwen2DecoderLayer geri gelir
+        block = torch.load(block_path, map_location=self.device, weights_only=False)
+        block.eval()
         
         # Cache'e ekle
         self._loaded_blocks[block_idx] = block

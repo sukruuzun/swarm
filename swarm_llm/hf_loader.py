@@ -261,6 +261,17 @@ class HuggingFaceBlockLoader(nn.Module):
                 num_blocks=num_blocks,
                 top_k=top_k,
             ).to(self.device)
+        
+        # KRİTİK: Router'ı modelin dtype'ına cast et
+        # Model float16 iken router float32 → LayerNorm'da dtype mismatch
+        if self.model is not None:
+            try:
+                model_dtype = next(self.model.parameters()).dtype
+                if model_dtype != torch.float32:
+                    self.router = self.router.to(dtype=model_dtype)
+                    print(f"   Router dtype: {model_dtype} (model ile eşleştirildi)")
+            except StopIteration:
+                pass
 
         # Embedding layer'ı bul
         self.embed_layer = self._get_embed_layer()

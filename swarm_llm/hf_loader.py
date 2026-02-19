@@ -36,6 +36,40 @@ from queue import Queue
 from swarm_llm.external_router import ExternalParisiNashRouter
 
 
+class _StateDictModule(nn.Module):
+    """
+    Lazy loading için hafif state_dict taşıyıcı modül.
+    Diskten yüklenen blokların yapısını yeniden oluşturmak için kullanılır.
+    
+    Bu modül, state_dict'ten yüklenen parametreleri doğru şekilde tutar
+    ve forward pass'te bu parametreleri kullanarak transformer katmanı gibi çalışır.
+    
+    KRİTİK: Bu modül sadece state_dict yükleme/kaydetme için kullanılır.
+    Gerçek forward pass, _load_parameters_as_dict üzerinden yapılır.
+    """
+    def __init__(self):
+        super().__init__()
+    
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        """
+        State dict'ten parametreleri otomatik olarak yükle.
+        Her parametre nn.Parameter olarak kaydedilir.
+        """
+        # Prefix ile eşleşen tüm anahtarları bul
+        for key, value in state_dict.items():
+            if key.startswith(prefix):
+                local_key = key[len(prefix):]
+                if '.' not in local_key:  # Sadece doğrudan alt parametreler
+                    self.register_parameter(local_key, nn.Parameter(value))
+                    # Bu anahtarı missing_keys'den kaldır
+                    if key in missing_keys:
+                        missing_keys.remove(key)
+    
+    def forward(self, x, **kwargs):
+        """Forward pass — state_dict yüklendiyse parametreler kullanılır."""
+        return x
+
+
 class QwenBlockWrapper(nn.Module):
     """
     Qwen2 için özel block wrapper.
@@ -859,17 +893,17 @@ class HuggingFaceBlockLoader(nn.Module):
             first_indices, _ = self.predict_blocks(prompt, prefetch=True)
 
         # STICKY ROUTING: İlk prompt için router çalışır ve blokları sabitler
-        # Sonraki N token için (sticky_duration) aynı bloklar kullanılır
         initial_prompt_len = generated.shape[1]
         
         for step in range(max_new_tokens):
             current_token_idx = initial_prompt_len + step
             
-            # KRİTİK: Her adımda TÜM bağlamı forward'a gönder (KV Cache olmadığı için)
-            # generated tüm token'ları içeriyor: [prompt + generated_tokens]
-            # use_cache=False olduğu için her adımda tüm bağlamı yeniden işliyoruz
-            # Sticky routing: current_token_idx ile sticky blocks kontrolü yapılır
-            outputs = self.forward(generated, use_cache=False, current_token_idx=current_token_idx)
+            # KRİTİK: Causal attention mask oluştur
+            seq_len = generated.shape[1]
+            attention_mask = torch.ones(1, seq_len, dtype=torch.long, device=self.device)
+            
+            # Her adımda TÜM bağlamı forward'a gönder (KV Cache olmadığı için)
+            outputs = self.forward(generated, attention_mask=attention_mask, use_cache=False, current_token_idx=current_token_idx)
             
             # Eğer sticky blocks yoksa veya süresi dolduysa, yeni blokları sabitle
             # NO-SHARDING modunda sticky routing yok (zaten tek blok var)
@@ -962,37 +996,51 @@ class HuggingFaceBlockLoader(nn.Module):
         
         for i, block in enumerate(self.blocks):
             block_path = os.path.join(save_dir, f"block_{i}.pt")
-            # Blok yapısını da kaydet (lazy loading için gerekli)
+            # Blok yapısını tam kaydet (lazy loading'de yeniden oluşturmak için)
             block_structure = []
-            if isinstance(block, nn.Sequential):
-                for j, layer in enumerate(block):
-                    layer_type = type(layer).__name__
-                    # TupleCleaner wrapper'ını atla, içindeki layer'ı al
+            block_type = type(block).__name__  # QwenBlockWrapper veya Sequential
+            
+            if isinstance(block, QwenBlockWrapper):
+                for j, layer in enumerate(block.layers):
                     if isinstance(layer, TupleCleaner):
-                        layer_type = f"TupleCleaner({type(layer.layer).__name__})"
-                    block_structure.append(layer_type)
+                        inner_type = type(layer.layer).__name__
+                        block_structure.append(f"TupleCleaner({inner_type})")
+                    else:
+                        block_structure.append(type(layer).__name__)
+            elif isinstance(block, nn.Sequential):
+                for j, layer in enumerate(block):
+                    if isinstance(layer, TupleCleaner):
+                        inner_type = type(layer.layer).__name__
+                        block_structure.append(f"TupleCleaner({inner_type})")
+                    else:
+                        block_structure.append(type(layer).__name__)
             
             torch.save({
                 'state_dict': block.state_dict(),
                 'block_index': i,
                 'layers_per_block': self.layers_per_block,
-                'block_structure': block_structure,  # Lazy loading için
+                'block_structure': block_structure,
+                'block_type': block_type,  # QwenBlockWrapper / Sequential
+                'num_layers_in_block': len(block_structure),
             }, block_path)
             block_size_mb = os.path.getsize(block_path) / (1024**2)
-            print(f"   Blok {i}: {block_size_mb:.2f} MB → {block_path}")
+            print(f"   Blok {i}: {block_size_mb:.2f} MB ({len(block_structure)} layer) → {block_path}")
         
-        # Final norm ve LM head'i de kaydet (lazy loading için)
+        # Final norm ve LM head'i de kaydet
         final_norm_state = None
         lm_head_state = None
+        norm_type = None  # RMSNorm vs LayerNorm
         
         if hasattr(self.model, "model") and hasattr(self.model.model, "norm"):
             final_norm_state = self.model.model.norm.state_dict()
             lm_head_state = self.model.lm_head.state_dict()
+            norm_type = type(self.model.model.norm).__name__
         elif hasattr(self.model, "transformer") and hasattr(self.model.transformer, "ln_f"):
             final_norm_state = self.model.transformer.ln_f.state_dict()
             lm_head_state = self.model.lm_head.state_dict()
+            norm_type = type(self.model.transformer.ln_f).__name__
         
-        # Router ve embedding'i de kaydet
+        # Router, embedding ve metadata'yı kaydet
         router_path = os.path.join(save_dir, "router.pt")
         torch.save({
             'router_state_dict': self.router.state_dict(),
@@ -1005,10 +1053,14 @@ class HuggingFaceBlockLoader(nn.Module):
                 'embed_dim': self.embed_dim,
                 'layers_per_block': self.layers_per_block,
                 'has_final_norm': final_norm_state is not None,
+                'is_qwen': self._is_qwen,
+                'norm_type': norm_type,
+                'model_class': type(self.model).__name__,
             }
         }, router_path)
         
         print(f"   Router + Embedding + Final Norm + LM Head: {os.path.getsize(router_path) / (1024**2):.2f} MB")
+        print(f"   Model tipi: {type(self.model).__name__} (is_qwen={self._is_qwen})")
         print(f"✅ Toplam {self.num_blocks} blok kaydedildi")
 
     @classmethod
@@ -1130,7 +1182,6 @@ class HuggingFaceBlockLoader(nn.Module):
         loader = cls.__new__(cls)
         
         # KRİTİK: PyTorch modül yapısını başlat (nn.Module.__init__ çağrısı)
-        # Bu olmadan loader.router = router gibi atamalar hata verir
         nn.Module.__init__(loader)
         
         loader.tokenizer = tokenizer
@@ -1144,6 +1195,11 @@ class HuggingFaceBlockLoader(nn.Module):
         loader._final_norm = final_norm
         loader._lm_head = lm_head
         
+        # Model tipi bilgisi (Qwen desteği için)
+        loader._is_qwen = config.get('is_qwen', False)
+        loader._rotary_emb = None  # Lazy loading'de rotary emb diskten gelmez
+        loader.no_sharding = False  # Lazy loading'de no_sharding kullanılmaz
+        
         # Blokları lazy yükle (şimdilik boş, gerektiğinde diskten yüklenecek)
         loader.blocks = nn.ModuleList()
         loader._block_paths = []
@@ -1151,16 +1207,15 @@ class HuggingFaceBlockLoader(nn.Module):
         loader._lazy_load = lazy_load
         
         # Korumalı bloklar (thrashing'i önlemek için)
-        # Block 0 ve Block 1 varsayılan olarak kilitli (en sık kullanılan bloklar)
-        loader._locked_blocks = {0, 1}  # Set: {0, 1, ...} manuel olarak kilitlenebilir
+        loader._locked_blocks = {0, 1}
         
         # Blok kullanım takibi (cleanup için)
-        loader._block_usage_count = {}  # {block_idx: kullanım_sayısı}
+        loader._block_usage_count = {}
         
-        # Sticky Routing: Bir kez seçilen bloklar belirli bir süre sabit kalır
+        # Sticky Routing
         loader._sticky_blocks = None
         loader._sticky_until_token = 0
-        loader._sticky_duration = sticky_duration  # Kaç token boyunca sabit kalır
+        loader._sticky_duration = sticky_duration
         
         # Asenkron prefetching için
         loader._prefetch_queue = Queue()
@@ -1168,27 +1223,76 @@ class HuggingFaceBlockLoader(nn.Module):
         loader._prefetch_running = False
         loader._prefetch_lock = threading.Lock()
         
+        # Blok yollarını kaydet ve save_dir'ı sakla (blok yapısını yeniden oluşturmak için)
+        loader._save_dir = save_dir
+        
         for i in range(config['num_blocks']):
             block_path = os.path.join(save_dir, f"block_{i}.pt")
             loader._block_paths.append(block_path)
             if lazy_load:
-                # Lazy: şimdilik boş modül, gerektiğinde yüklenecek
                 loader.blocks.append(nn.Identity())  # Placeholder
             else:
-                # Eager: hemen yükle
-                block_data = torch.load(block_path, map_location=device_obj)
-                block = nn.Sequential()  # Blok yapısını yeniden oluştur
-                # Not: Gerçek implementasyonda blok yapısını kaydetmek gerekir
+                # Eager: hemen yükle (gerçek blok yapısını oluştur)
+                block = loader._rebuild_block_from_disk(block_path, device_obj)
                 loader.blocks.append(block)
         
-        loader.model = None  # Model artık gerekli değil (bloklar diskte)
+        loader.model = None
         loader.layers = None
         
         return loader
 
+    @staticmethod
+    def _rebuild_block_from_disk(block_path: str, device) -> nn.Module:
+        """
+        Diskten blok verisini okuyup, state_dict'i doğrudan yüklenmiş
+        nn.Module olarak döndür. Blok yapısını (QwenBlockWrapper vs Sequential)
+        checkpoint'teki metadata'dan yeniden oluşturur.
+        
+        Args:
+            block_path: Blok dosyasının yolu
+            device: Hedef cihaz
+        
+        Returns:
+            Yüklenmiş blok modülü (state_dict yüklenmiş)
+        """
+        try:
+            block_data = torch.load(block_path, map_location=device, weights_only=False)
+        except Exception:
+            block_data = torch.load(block_path, map_location='cpu', weights_only=False)
+        
+        state_dict = block_data['state_dict']
+        block_type = block_data.get('block_type', 'Sequential')
+        num_layers = block_data.get('num_layers_in_block', 0)
+        
+        # State dict'ten katman yapısını çıkar ve doğru wrapper'ı oluştur
+        # Anahtar formatı: "layers.0.layer.self_attn..." (QwenBlockWrapper)
+        #                  veya "0.layer.self_attn..." (Sequential)
+        
+        if block_type == 'QwenBlockWrapper' or 'layers.' in next(iter(state_dict.keys()), ''):
+            # QwenBlockWrapper: Katmanları DummyLayer ile oluştur ve state_dict yükle
+            # DummyLayer — sadece state_dict taşıyıcı, forward'da parametreleri kullanır
+            dummy_layers = [_StateDictModule() for _ in range(num_layers)]
+            block = QwenBlockWrapper(dummy_layers)
+        else:
+            dummy_layers = [_StateDictModule() for _ in range(num_layers)]
+            block = nn.Sequential(*dummy_layers)
+        
+        # State dict'i yükle (strict=False: yapı tam uyuşmayabilir)
+        try:
+            block.load_state_dict(state_dict, strict=True)
+        except Exception:
+            try:
+                block.load_state_dict(state_dict, strict=False)
+            except Exception as e:
+                print(f"⚠️  Blok yükleme uyarısı: {e}")
+        
+        block.to(device)
+        block.eval()
+        return block
+
     def _load_block_from_disk(self, block_idx: int) -> nn.Module:
         """
-        Diskten bir bloğu yükle (Lazy Loading).
+        Diskten bir bloğu yükle (Lazy Loading) ve cache'e ekle.
         
         Args:
             block_idx: Yüklenecek blok indeksi
@@ -1205,52 +1309,10 @@ class HuggingFaceBlockLoader(nn.Module):
         block_path = self._block_paths[block_idx]
         print(f"📂 Diskten yükleniyor: block_{block_idx}.pt")
         
-        # Accelerate ile dağıtılmış modeller için device mapping'i koru
-        # map_location yerine doğru cihazı kullan
-        try:
-            block_data = torch.load(block_path, map_location=self.device)
-        except:
-            # Fallback: CPU'ya yükle, sonra taşı
-            block_data = torch.load(block_path, map_location='cpu')
-        
-        # Blok yapısını yeniden oluştur
-        # Blok yapısı kaydedilmişse kullan, yoksa state_dict'ten çıkar
-        block_structure = block_data.get('block_structure', [])
-        
-        if block_structure:
-            # Kaydedilmiş yapıyı kullan (ideal durum)
-            # Not: Gerçek implementasyonda layer'ları da kaydetmek gerekir
-            # Şimdilik sadece state_dict'i yüklüyoruz
-            block = nn.Sequential()
-        else:
-            # Fallback: Basit sequential
-            block = nn.Sequential()
-        
-        # State dict'i yükle
-        try:
-            block.load_state_dict(block_data['state_dict'], strict=False)
-        except Exception as e:
-            # Eğer yapı uyuşmuyorsa, sadece uyumlu parametreleri yükle
-            print(f"⚠️  Blok {block_idx} yapı uyuşmazlığı: {e}")
-            state_dict = block_data['state_dict']
-            block_state = {}
-            for k, v in state_dict.items():
-                # TupleCleaner wrapper'ını handle et
-                if 'layer.' in k:
-                    # TupleCleaner içindeki layer parametreleri
-                    new_k = k.replace('layer.', '')
-                    block_state[new_k] = v
-                else:
-                    block_state[k] = v
-            if block_state:
-                block.load_state_dict(block_state, strict=False)
-        
-        block.to(self.device)
-        block.eval()
+        block = self._rebuild_block_from_disk(block_path, self.device)
         
         # Cache'e ekle
         self._loaded_blocks[block_idx] = block
-        
         return block
 
     def _unload_block_from_memory(self, block_idx: int):

@@ -1425,8 +1425,34 @@ class HuggingFaceBlockLoader(nn.Module):
         if original_dtype != torch.float32:
             self.router = self.router.to(dtype=original_dtype)
         
-        # Router temperature'ını düşür → daha keskin seçim
+        # ── TEORİ ENTEGRASYONU ──
+        # Router temperature'ını düşür (Parisi tavlama son aşaması)
         self.router.set_temperature(0.5)
+        
+        # Nash regret'i seed et: En iyi kombo bloklarına avantaj
+        # Negatif regret = "bu blok yeterince seçildi" → avantaj
+        # Pozitif regret = "bu blok az seçildi" → dezavantaj (bu durumda istemiyoruz)
+        regret_seed = torch.zeros(self.num_blocks, device=self.device)
+        usage_seed = torch.zeros(self.num_blocks, device=self.device)
+        for bi in best_combo:
+            regret_seed[bi] = 0.3   # Pozitif regret → logit bonusu → daha çok seçilir
+            usage_seed[bi] = 0.4    # Yüksek usage → sürü hafızası
+        for bi in range(self.num_blocks):
+            if bi not in best_combo:
+                regret_seed[bi] = -0.1  # Negatif regret → logit penalty
+                usage_seed[bi] = 0.1
+        self.router.cumulative_regret.copy_(regret_seed)
+        self.router.block_usage.copy_(usage_seed)
+        
+        # Teori durumu raporu
+        stats = self.router.get_stats()
+        print(f"\n📐 Teori Durumu:")
+        ts = stats.get('theory_status', {})
+        print(f"   Nash Regret: {'✅ Aktif' if ts.get('nash_regret_active') else '❌ Pasif'}")
+        print(f"   Parisi Tavlama: {'✅ Aktif' if ts.get('parisi_annealing_active') else '⏸️  Soğuma tamamlandı'}")
+        print(f"   Sığırcık Keşif: {'✅ Aktif' if ts.get('starling_exploration_active') else '❌ Pasif'}")
+        print(f"   Regret: {[f'{r:.3f}' for r in stats['regret'].tolist()]}")
+        print(f"   Usage: {[f'{u:.3f}' for u in stats['usage'].tolist()]}")
         
         # Sonuç
         print(f"\n✅ Kalibrasyon tamamlandı!")

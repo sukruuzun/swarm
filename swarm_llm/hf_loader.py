@@ -30,6 +30,8 @@ Kullanım:
 import torch
 import torch.nn as nn
 from typing import List, Optional, Tuple
+import threading
+from queue import Queue
 
 from swarm_llm.external_router import ExternalParisiNashRouter
 
@@ -182,13 +184,14 @@ class HuggingFaceBlockLoader(nn.Module):
         return blocks
 
     @torch.no_grad()
-    def predict_blocks(self, prompt: str) -> Tuple[List[int], torch.Tensor]:
+    def predict_blocks(self, prompt: str, prefetch: bool = True) -> Tuple[List[int], torch.Tensor]:
         """
         Teoreminin beyni: Giriş cümlesine bakarak hangi blokların
         gerekli olduğunu tahmin eder. Modeli çalıştırmadan önce çağrılır.
 
         Args:
             prompt: Giriş metni
+            prefetch: True ise tahmin edilen blokları arka planda yüklemeye başlar
 
         Returns:
             block_indices: [i1, i2, ...] yüklenecek blok indeksleri
@@ -198,7 +201,13 @@ class HuggingFaceBlockLoader(nn.Module):
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
         x = self.embed_layer(input_ids)  # (1, L, D)
 
-        return self.router.get_predictive_indices(x, pool_input=True)
+        block_indices, weights = self.router.get_predictive_indices(x, pool_input=True)
+        
+        # Asenkron prefetching: Tahmin edilen blokları arka planda yükle
+        if prefetch and self._lazy_load:
+            self.prefetch_blocks(block_indices)
+        
+        return block_indices, weights
 
     def forward(
         self,
@@ -237,8 +246,14 @@ class HuggingFaceBlockLoader(nn.Module):
         
         for idx in selected_indices:
             # Lazy loading: Eğer blok diskte ise önce yükle
-            if self._lazy_load and idx not in self._loaded_blocks:
-                block = self._load_block_from_disk(idx)
+            if self._lazy_load:
+                # Prefetch cache'inde var mı kontrol et
+                with self._prefetch_lock:
+                    if idx in self._loaded_blocks:
+                        block = self._loaded_blocks[idx]
+                    else:
+                        # Prefetch henüz tamamlanmamış, şimdi yükle
+                        block = self._load_block_from_disk(idx)
             else:
                 block = self.blocks[idx]
             
@@ -333,15 +348,18 @@ class HuggingFaceBlockLoader(nn.Module):
         max_new_tokens: int = 50,
         temperature: float = 0.8,
         top_k: int = 40,
+        prefetch_next: bool = True,
     ) -> str:
         """
         Metin üretimi: Her adımda router hangi blokları kullanacağına karar verir.
+        Asenkron prefetching ile bir sonraki adımın blokları önceden yüklenir.
 
         Args:
             prompt: Başlangıç metni
             max_new_tokens: Üretilecek maksimum token sayısı
             temperature: Sampling sıcaklığı
             top_k: Top-K sampling
+            prefetch_next: True ise bir sonraki adımın bloklarını önceden yükle
 
         Returns:
             Üretilmiş metin
@@ -350,7 +368,11 @@ class HuggingFaceBlockLoader(nn.Module):
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
         generated = input_ids
 
-        for _ in range(max_new_tokens):
+        # İlk blokları prefetch et
+        if prefetch_next and self._lazy_load:
+            first_indices, _ = self.predict_blocks(prompt, prefetch=True)
+
+        for step in range(max_new_tokens):
             # Forward (sadece seçilen bloklar)
             outputs = self.forward(generated)
             logits = outputs["logits"][:, -1, :] / temperature
@@ -361,6 +383,12 @@ class HuggingFaceBlockLoader(nn.Module):
             probs = torch.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, 1)
             generated = torch.cat([generated, next_token], dim=1)
+
+            # Bir sonraki adımın bloklarını prefetch et (asenkron)
+            if prefetch_next and self._lazy_load and step < max_new_tokens - 1:
+                # Son token'a bakarak bir sonraki adımın bloklarını tahmin et
+                next_prompt = self.tokenizer.decode(generated[0].tolist(), skip_special_tokens=True)
+                next_indices, _ = self.predict_blocks(next_prompt, prefetch=True)
 
         return self.tokenizer.decode(generated[0].tolist(), skip_special_tokens=True)
 
@@ -539,6 +567,12 @@ class HuggingFaceBlockLoader(nn.Module):
         loader._loaded_blocks = {}  # Cache: {block_idx: nn.Module}
         loader._lazy_load = lazy_load
         
+        # Asenkron prefetching için
+        loader._prefetch_queue = Queue()
+        loader._prefetch_thread = None
+        loader._prefetch_running = False
+        loader._prefetch_lock = threading.Lock()
+        
         for i in range(config['num_blocks']):
             block_path = os.path.join(save_dir, f"block_{i}.pt")
             loader._block_paths.append(block_path)
@@ -630,3 +664,58 @@ class HuggingFaceBlockLoader(nn.Module):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             print(f"🗑️  Blok {block_idx} RAM'den kaldırıldı")
+
+    def _prefetch_worker(self):
+        """
+        Arka plan thread'i: Prefetch kuyruğundaki blokları yükler.
+        """
+        while self._prefetch_running:
+            try:
+                block_idx = self._prefetch_queue.get(timeout=1.0)
+                if block_idx is None:  # Shutdown signal
+                    break
+                
+                # Blok zaten yüklü mü kontrol et
+                with self._prefetch_lock:
+                    if block_idx not in self._loaded_blocks:
+                        self._load_block_from_disk(block_idx)
+                
+                self._prefetch_queue.task_done()
+            except:
+                continue
+
+    def start_prefetching(self):
+        """Asenkron prefetching'i başlat."""
+        if self._prefetch_thread is None or not self._prefetch_thread.is_alive():
+            self._prefetch_running = True
+            self._prefetch_thread = threading.Thread(target=self._prefetch_worker, daemon=True)
+            self._prefetch_thread.start()
+            print("🚀 Asenkron prefetching başlatıldı")
+
+    def stop_prefetching(self):
+        """Asenkron prefetching'i durdur."""
+        self._prefetch_running = False
+        self._prefetch_queue.put(None)  # Shutdown signal
+        if self._prefetch_thread is not None:
+            self._prefetch_thread.join(timeout=2.0)
+        print("⏹️  Asenkron prefetching durduruldu")
+
+    def prefetch_blocks(self, block_indices: List[int]):
+        """
+        Blokları önceden yükle (asenkron).
+        Router'ın tahmin ettiği blokları arka planda yüklemeye başlar.
+        
+        Args:
+            block_indices: Yüklenecek blok indeksleri listesi
+        """
+        if not self._lazy_load:
+            return
+        
+        # Prefetching başlatılmamışsa başlat
+        if self._prefetch_thread is None or not self._prefetch_thread.is_alive():
+            self.start_prefetching()
+        
+        # Blokları kuyruğa ekle
+        for idx in block_indices:
+            if idx not in self._loaded_blocks:
+                self._prefetch_queue.put(idx)

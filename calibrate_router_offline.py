@@ -105,11 +105,35 @@ def load_and_run_block(block_idx, hidden_states, position_embeddings, position_i
 # ── Router.pt'den embed, norm, lm_head yükle ──
 print(f"\n📦 Router + embed + norm + lm_head yükleniyor...")
 router_data = torch.load(os.path.join(SAVE_DIR, "router.pt"), map_location='cpu', weights_only=False)
+config = router_data.get("config", {})
 
-embed_layer = router_data["embed_layer"].to(device)
-final_norm = router_data["final_norm"].to(device)
-lm_head = router_data["lm_head"].to(device)
-router = router_data["router"]  # CPU'da kalsın (eğitim için)
+# Embed layer
+embed_dim = config.get("embed_dim", 3584)
+vocab_size = router_data["embed_state_dict"]["weight"].shape[0]
+embed_layer = torch.nn.Embedding(vocab_size, embed_dim)
+embed_layer.load_state_dict(router_data["embed_state_dict"])
+embed_layer = embed_layer.to(device)
+
+# Final norm (Qwen2RMSNorm → sadece weight var, basit RMSNorm kullan)
+from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
+final_norm = Qwen2RMSNorm(embed_dim)
+final_norm.load_state_dict(router_data["final_norm_state_dict"])
+final_norm = final_norm.to(device)
+
+# LM Head
+lm_head = torch.nn.Linear(embed_dim, vocab_size, bias=False)
+lm_head.load_state_dict(router_data["lm_head_state_dict"])
+lm_head = lm_head.to(device)
+
+# Router
+from swarm_llm.external_router import ExternalParisiNashRouter
+router = ExternalParisiNashRouter(
+    embed_dim=embed_dim,
+    num_blocks=config.get("num_blocks", num_blocks),
+    top_k=TOP_K,
+)
+router.load_state_dict(router_data["router_state_dict"])
+# Router CPU'da kalır (eğitim için)
 
 # Rotary embeddings
 rotary_emb = None
@@ -119,7 +143,44 @@ if os.path.exists(rotary_path):
     print(f"✅ Rotary embeddings yüklendi")
 
 embed_dtype = next(embed_layer.parameters()).dtype
-print(f"✅ Embed/Norm/LM_Head yüklendi (dtype: {embed_dtype})")
+print(f"✅ Tüm bileşenler yüklendi (dtype: {embed_dtype})")
+
+# ── ADIM 0: ARF İMZALARI (BLOK KİMLİKLERİ) ──
+print(f"\n🎨 ADIM 0: Arf Değişmezleri (Blok Kimlikleri) hesaplanıyor...")
+with torch.no_grad():
+    for i in range(num_blocks):
+        print(f"    Block {i} imzası çıkarılıyor...", end=" ", flush=True)
+        block_path = os.path.join(SAVE_DIR, f"block_{i}.pt")
+        # Sadece ağırlıkları yükle (bellek dostu)
+        block = torch.load(block_path, map_location='cpu', weights_only=False)
+        
+        # İmza hesapla (hf_loader'daki mantıkla aynı)
+        all_params = []
+        for p in block.parameters():
+            if p.dim() >= 2:
+                all_params.append(p.view(-1))
+        
+        if all_params:
+            flat_p = torch.cat(all_params)
+            sig = torch.zeros(router.signature_dim, dtype=torch.float32)
+            sig[0] = flat_p.mean()
+            sig[1] = flat_p.std()
+            sig[2] = torch.norm(flat_p) / (flat_p.numel()**0.5)
+            sig[3] = flat_p.abs().max()
+            sig[4] = (flat_p.abs() > 0.01).float().mean()
+            
+            chunks = 11
+            chunk_size = flat_p.numel() // chunks
+            for j in range(chunks):
+                sig[5 + j] = flat_p[j * chunk_size : (j + 1) * chunk_size].mean()
+            
+            router.arf_signatures[i] = sig
+            print("✅")
+        else:
+            print("⚠️ (Ağırlık bulunamadı)")
+        del block
+        import gc
+        gc.collect()
 
 # ── Yardımcı: Hidden states → logits ──
 def get_logits(hidden_states):
@@ -319,8 +380,9 @@ router = router.to(dtype=router_dtype)
 # ═══════════════════════════════════════════════════════════════
 # KAYDET
 # ═══════════════════════════════════════════════════════════════
-# Router'ı güncelle
-router_data["router"] = router
+# Router state_dict'ini güncelle
+router_data["router_state_dict"] = router.state_dict()
+router_data["config"]["num_blocks"] = num_blocks
 torch.save(router_data, os.path.join(SAVE_DIR, "router.pt"))
 
 # Kalibrasyon verilerini de kaydet (debug için)

@@ -254,6 +254,11 @@ class HuggingFaceBlockLoader(nn.Module):
             except StopIteration:
                 pass
 
+        # ── ARF İMZALARINI HESAPLA ──
+        if not no_sharding:
+            print("🎨 Arf Değişmezleri (Blok Kimlikleri) hesaplanıyor...")
+            self.update_arf_signatures()
+
         # Embedding layer'ı bul
         self.embed_layer = self._get_embed_layer()
         
@@ -588,6 +593,65 @@ class HuggingFaceBlockLoader(nn.Module):
                 blocks.append(nn.Identity())
 
         return blocks
+
+    @torch.no_grad()
+    def update_arf_signatures(self):
+        """
+        Her bloğun Arf Değişmezini (signature) hesaplar.
+        Blok ağırlıklarının yapısal 'parmak izini' çıkarır.
+        """
+        self.eval()
+        for i, block in enumerate(self.blocks):
+            if isinstance(block, nn.Identity):
+                continue
+                
+            sig = self._get_block_identity(block)
+            # Router'a kaydet (buffer olduğu için otomatik dağılır)
+            if sig is not None:
+                self.router.arf_signatures[i] = sig.to(self.router.arf_signatures.device)
+        
+        print(f"✅ {self.num_blocks} blok için Arf imzaları güncellendi.")
+
+    def _get_block_identity(self, block: nn.Module) -> torch.Tensor:
+        """
+        Bloğun ağırlıklarından 16 boyutlu bir kimlik (signature) çıkarır.
+        Matematiksel temeli: Moment-based structural invariants.
+        """
+        all_params = []
+        for p in block.parameters():
+            if p.dim() >= 2:  # Sadece Linear/Conv layer ağırlıkları (bias hariç)
+                all_params.append(p.view(-1))
+        
+        if not all_params:
+            return torch.zeros(self.router.signature_dim)
+        
+        # Kritik parametreleri birleştir (bellek dostu olması için rasgele örnekleme yapılabilir)
+        # Ama burada tam ağırlık merkezine bakıyoruz
+        flat_p = torch.cat(all_params)
+        
+        # 16 boyutlu imza vektörü
+        sig = torch.zeros(self.router.signature_dim, dtype=flat_p.dtype, device=flat_p.device)
+        
+        # 1. Moment: Ortalama
+        sig[0] = flat_p.mean()
+        # 2. Moment: Std
+        sig[1] = flat_p.std()
+        # 3. Enerji: L2 Norm (normalize)
+        sig[2] = torch.norm(flat_p) / (flat_p.numel()**0.5)
+        # 4. Maksimum Aktivite
+        sig[3] = flat_p.abs().max()
+        # 5. Seyreklik (Sparsity analojisi)
+        sig[4] = (flat_p.abs() > 0.01).float().mean()
+        
+        # 6-16: Spektral özetler (CHUNK'lara bölüp ortalama alarak yapısal dağılımı anla)
+        chunks = 11
+        chunk_size = flat_p.numel() // chunks
+        for j in range(chunks):
+            start = j * chunk_size
+            end = (j + 1) * chunk_size
+            sig[5 + j] = flat_p[start:end].mean()
+            
+        return sig
 
     @torch.no_grad()
     def predict_blocks(self, prompt: str, prefetch: bool = True) -> Tuple[List[int], torch.Tensor]:

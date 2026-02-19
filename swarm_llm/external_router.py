@@ -92,6 +92,22 @@ class ExternalParisiNashRouter(nn.Module):
         self.register_buffer("block_usage", torch.zeros(num_blocks))
         self.register_buffer("step_count", torch.tensor(0, dtype=torch.long))
 
+        # ── ARF DEĞİŞMEZİ (BLOCK IDENTITY) ──
+        self.signature_dim = 16
+        # Her bloğun 'öz kimliği' (invariant). hf_loader tarafından ağırlıklardan hesaplanır.
+        self.register_buffer("arf_signatures", torch.zeros(num_blocks, self.signature_dim))
+        
+        # Prompt'u kimlik uzayına izdüşüren katman (Prompt -> Signature Space)
+        self.arf_projector = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, self.signature_dim * 2),
+            nn.GELU(),
+            nn.Linear(self.signature_dim * 2, self.signature_dim),
+        )
+        
+        # Arf etkisinin ağırlığı (alpha_arf)
+        self.register_buffer("arf_weight", torch.tensor(1.0))
+
     def set_temperature(self, t: float):
         self.current_temperature.fill_(t)
 
@@ -156,6 +172,13 @@ class ExternalParisiNashRouter(nn.Module):
         # ── 1. MLP GATE: Ham logitler ──
         T = self.current_temperature.clamp(min=0.1)
         logits = self.gate(x) / T
+
+        # ── 1.5 ARF ALIGNMENT: Blok Kimliği Eşleşmesi ──
+        # x: (B, L, D) -> x_sig: (B, L, sig_dim)
+        x_sig = self.arf_projector(x)
+        # arf_scores: (B, L, num_blocks) - prompt imzası ile blok imzaları arasındaki benzerlik
+        arf_scores = torch.matmul(x_sig, self.arf_signatures.T) * self.arf_weight
+        logits = logits + arf_scores
 
         # ── 2. NASH DENGESİ: Regret düzeltmesi ──
         # Biriken pişmanlık logitlere eklenir → az seçilen bloklar avantaj kazanır
@@ -242,6 +265,11 @@ class ExternalParisiNashRouter(nn.Module):
         T = self.current_temperature.clamp(min=0.1)
         logits = self.gate(x) / T
         
+        # ARF: Blok Kimliği Eşleşmesi
+        x_sig = self.arf_projector(x)
+        arf_scores = torch.matmul(x_sig, self.arf_signatures.T) * self.arf_weight
+        logits = logits + arf_scores
+
         # NASH: Regret düzeltmesi
         regret_bonus = self.cumulative_regret * self.regret_weight
         logits = logits + regret_bonus.unsqueeze(0).unsqueeze(0)

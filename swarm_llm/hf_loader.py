@@ -142,28 +142,63 @@ class HuggingFaceBlockLoader(nn.Module):
         self._loaded_blocks = {}
 
     def _extract_layers(self) -> nn.ModuleList:
-        """Model'den transformer layer'larını çıkar."""
+        """
+        Model'den transformer layer'larını çıkar.
+        Desteklenen yapılar:
+        - Llama: model.model.layers
+        - Qwen: model.model.layers veya model.layers
+        - GPT-2: model.transformer.h
+        - Mistral: model.model.layers
+        """
+        # Qwen/Llama/Mistral: model.model.layers
         if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
             return self.model.model.layers
+        # Bazı Qwen varyantları: model.layers
         elif hasattr(self.model, "layers"):
             return self.model.layers
+        # GPT-2: model.transformer.h
         elif hasattr(self.model, "transformer") and hasattr(self.model.transformer, "h"):
             return self.model.transformer.h
         else:
+            # Debug: Model yapısını göster
+            print(f"⚠️  Model yapısı: {type(self.model)}")
+            if hasattr(self.model, "model"):
+                print(f"   model.model: {type(self.model.model)}")
+                if hasattr(self.model.model, "__dict__"):
+                    print(f"   model.model attributes: {list(self.model.model.__dict__.keys())[:10]}")
             raise ValueError(
-                "Model yapısı desteklenmiyor. Llama/Qwen/Mistral gibi modeller bekleniyor."
+                "Model yapısı desteklenmiyor. Llama/Qwen/Mistral gibi modeller bekleniyor.\n"
+                f"Model tipi: {type(self.model)}\n"
+                "Lütfen model yapısını kontrol edin veya issue açın."
             )
 
     def _get_embed_layer(self) -> nn.Module:
-        """Embedding layer'ı bul."""
+        """
+        Embedding layer'ı bul.
+        Desteklenen yapılar:
+        - Llama/Qwen: model.model.embed_tokens
+        - GPT-2: model.transformer.wte
+        - Bazı modeller: model.embed_tokens
+        """
+        # Qwen/Llama: model.model.embed_tokens
         if hasattr(self.model, "model") and hasattr(self.model.model, "embed_tokens"):
             return self.model.model.embed_tokens
+        # GPT-2: model.transformer.wte
         elif hasattr(self.model, "transformer") and hasattr(self.model.transformer, "wte"):
             return self.model.transformer.wte
+        # Bazı modeller: model.embed_tokens
         elif hasattr(self.model, "embed_tokens"):
             return self.model.embed_tokens
         else:
-            raise ValueError("Embedding layer bulunamadı.")
+            # Debug bilgisi
+            print(f"⚠️  Embedding layer bulunamadı. Model yapısı:")
+            if hasattr(self.model, "model"):
+                print(f"   model.model attributes: {[k for k in dir(self.model.model) if 'embed' in k.lower()]}")
+            raise ValueError(
+                "Embedding layer bulunamadı.\n"
+                f"Model tipi: {type(self.model)}\n"
+                "Lütfen model yapısını kontrol edin."
+            )
 
     def _get_embed_dim(self) -> int:
         """Embedding boyutunu bul."""

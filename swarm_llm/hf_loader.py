@@ -201,22 +201,17 @@ class HuggingFaceBlockLoader(nn.Module):
         if isinstance(indices, int):
             indices = [indices]
 
-        # Sadece seçilen blokları çalıştır
-        outputs = []
-        for idx in indices[: self.top_k]:
-            block_out = self.blocks[idx](x)
-            outputs.append(block_out)
-
-        # Ağırlıklı toplam
-        weights_cpu = weights.squeeze().cpu()
-        if weights_cpu.dim() == 0:
-            weights_cpu = weights_cpu.unsqueeze(0)
-        weights_cpu = weights_cpu[: len(outputs)]
-
-        x_out = torch.zeros_like(x)
-        for i, out in enumerate(outputs):
-            w = weights_cpu[i].item() if i < len(weights_cpu) else 1.0 / len(outputs)
-            x_out = x_out + w * out
+        # Sadece seçilen blokları sıralı çalıştır
+        # Not: Transformer blokları tuple döndürebilir, sadece hidden_states'i al
+        x_out = x
+        selected_indices = indices[: self.top_k]
+        
+        for idx in selected_indices:
+            block_out = self.blocks[idx](x_out)
+            # Tuple ise sadece ilk elemanı al (hidden_states)
+            if isinstance(block_out, tuple):
+                block_out = block_out[0]
+            x_out = block_out
 
         # Final norm ve LM head (model'e göre değişir)
         if hasattr(self.model, "model") and hasattr(self.model.model, "norm"):
@@ -229,11 +224,17 @@ class HuggingFaceBlockLoader(nn.Module):
             # Basit fallback
             logits = self.model.lm_head(x_out) if hasattr(self.model, "lm_head") else None
 
+        # Router weights'i hazırla
+        weights_cpu = weights.squeeze().cpu()
+        if weights_cpu.dim() == 0:
+            weights_cpu = weights_cpu.unsqueeze(0)
+        weights_list = weights_cpu[: len(selected_indices)].tolist()
+
         return {
             "logits": logits,
             "hidden_states": x_out,
-            "selected_indices": indices[: self.top_k],
-            "router_weights": weights_cpu.tolist(),
+            "selected_indices": selected_indices,
+            "router_weights": weights_list,
             "router_info": self.router.get_stats(),
         }
 

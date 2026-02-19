@@ -202,17 +202,41 @@ class HuggingFaceBlockLoader(nn.Module):
             indices = [indices]
 
         # Sadece seçilen blokları sıralı çalıştır
-        # Not: Transformer blokları tuple döndürebilir, sadece hidden_states'i al
+        # Not: Transformer blokları tuple veya BaseModelOutput döndürebilir
         x_out = x
         selected_indices = indices[: self.top_k]
         
         for idx in selected_indices:
             block_out = self.blocks[idx](x_out)
+            
             # Tuple ise sadece ilk elemanı al (hidden_states)
             if isinstance(block_out, tuple):
-                block_out = block_out[0]
-            x_out = block_out
+                x_out = block_out[0]
+            # BaseModelOutput gibi objeler için
+            elif hasattr(block_out, 'last_hidden_state'):
+                x_out = block_out.last_hidden_state
+            elif hasattr(block_out, 'hidden_states') and block_out.hidden_states:
+                x_out = block_out.hidden_states[-1]
+            # Tensor ise direkt kullan
+            elif isinstance(block_out, torch.Tensor):
+                x_out = block_out
+            else:
+                # Fallback: ilk elemanı dene
+                try:
+                    x_out = block_out[0] if hasattr(block_out, '__getitem__') else block_out
+                except:
+                    x_out = block_out
+            
+            # Güvenlik kontrolü: x_out hala tuple ise
+            if isinstance(x_out, tuple):
+                x_out = x_out[0]
 
+        # Final norm'dan önce tuple kontrolü
+        if isinstance(x_out, tuple):
+            x_out = x_out[0]
+        elif hasattr(x_out, 'last_hidden_state'):
+            x_out = x_out.last_hidden_state
+        
         # Final norm ve LM head (model'e göre değişir)
         if hasattr(self.model, "model") and hasattr(self.model.model, "norm"):
             x_out = self.model.model.norm(x_out)

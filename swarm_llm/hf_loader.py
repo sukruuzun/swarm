@@ -385,10 +385,12 @@ class HuggingFaceBlockLoader(nn.Module):
         weights_list = weights_cpu[: len(selected_indices)].tolist()
 
         # Lazy loading: Kullanılmayan blokları RAM'den kaldır (opsiyonel)
-        if self._lazy_load and len(self._loaded_blocks) > self.top_k:
-            # En eski kullanılmayan blokları kaldır
-            unused_blocks = set(self._loaded_blocks.keys()) - set(selected_indices)
-            for unused_idx in list(unused_blocks)[:len(unused_blocks) - self.top_k]:
+        # KRİTİK: Kilitli blokları (örn: Block 0) korumalı bloklar listesinden çıkar
+        if self._lazy_load and len(self._loaded_blocks) > self.top_k + len(self._locked_blocks):
+            # Kilitli blokları ve seçili blokları hariç tut
+            unused_blocks = set(self._loaded_blocks.keys()) - set(selected_indices) - self._locked_blocks
+            # Sadece kilitli olmayan blokları kaldır
+            for unused_idx in list(unused_blocks):
                 self._unload_block_from_memory(unused_idx)
         
         return {

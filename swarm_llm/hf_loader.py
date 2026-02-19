@@ -517,6 +517,11 @@ class HuggingFaceBlockLoader(nn.Module):
         
         # Lazy loader oluştur
         loader = cls.__new__(cls)
+        
+        # KRİTİK: PyTorch modül yapısını başlat (nn.Module.__init__ çağrısı)
+        # Bu olmadan loader.router = router gibi atamalar hata verir
+        nn.Module.__init__(loader)
+        
         loader.tokenizer = tokenizer
         loader.num_blocks = config['num_blocks']
         loader.top_k = config['top_k']

@@ -201,9 +201,13 @@ class HuggingFaceBlockLoader(nn.Module):
             # Model henüz dağıtılmamış (GPT-2 gibi küçük modeller), taşı
             self.model.to(self.device)
 
-        # KRİTİK: Qwen modeli kontrolünü en başta yap (no_sharding kontrolünden önce)
-        # Çünkü no_sharding modunda QwenBlockWrapper kullanmak için _is_qwen gerekli
+        # KRİTİK: Önce layers'ı çıkar (rotary_emb layers'a bağlı)
+        # Sonra Qwen kontrolü ve rotary embeddings
         self._is_qwen = self._detect_qwen_model()
+        
+        # Layers'ı ÖNCE çıkar (_extract_rotary_embeddings self.layers'a erişiyor)
+        self.layers = self._extract_layers()
+        
         self._rotary_emb = None
         if self._is_qwen and self.model is not None:
             self._rotary_emb = self._extract_rotary_embeddings()
@@ -215,7 +219,6 @@ class HuggingFaceBlockLoader(nn.Module):
         if no_sharding:
             # Tüm katmanları tek bir blok olarak kullan
             print("⚠️  NO-SHARDING TEST MODU: Model hiç bölünmeden tek blok olarak çalışacak")
-            self.layers = self._extract_layers()
             total_layers = len(self.layers)
             self.num_blocks = 1
             self.top_k = 1
@@ -230,8 +233,6 @@ class HuggingFaceBlockLoader(nn.Module):
             print(f"   Tüm {total_layers} katman tek blokta: Block 0")
         else:
             # Normal mod: Modeli bloklara böl
-            # Layer'ları bul (Llama/Qwen için genelde model.layers veya model.model.layers)
-            self.layers = self._extract_layers()
             total_layers = len(self.layers)
 
             if layers_per_block is None:

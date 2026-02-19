@@ -731,9 +731,13 @@ class HuggingFaceBlockLoader(nn.Module):
                             sin = sin.to(input_ids.device)
                         position_embeddings = (cos, sin)
                     else:
-                        print("⚠️  Rotary embeddings hesaplanamadı — tüm yöntemler başarısız")
+                        if not getattr(self, '_rotary_warn_printed', False):
+                            print("⚠️  Rotary embeddings hesaplanamadı — tüm yöntemler başarısız")
+                            self._rotary_warn_printed = True
                 else:
-                    print("⚠️  Rotary embedding bulunamadı (ne _rotary_emb ne de katmanlarda)")
+                    if not getattr(self, '_rotary_warn_printed', False):
+                        print("⚠️  Rotary embedding bulunamadı (ne _rotary_emb ne de katmanlarda)")
+                        self._rotary_warn_printed = True
             except Exception as e:
                 print(f"⚠️  Position embeddings hesaplanamadı: {e}")
                 import traceback
@@ -970,7 +974,8 @@ class HuggingFaceBlockLoader(nn.Module):
             if tokenizer_vocab_size and logits.size(-1) > tokenizer_vocab_size:
                 # Logits'in son kısmını -inf yap (tokenizer'ın bilmediği token'lar)
                 logits[:, tokenizer_vocab_size:] = float("-inf")
-                print(f"   ⚠️  Token ID clamp: Logits {logits.size(-1)} → {tokenizer_vocab_size} (tokenizer vocab_size)")
+                if step == 0:  # Sadece ilk adımda yazdır
+                    print(f"   ⚠️  Token ID clamp: Logits {logits.size(-1)} → {tokenizer_vocab_size} (tokenizer vocab_size) [sonraki adımlarda sessiz]")
 
             # Top-K sampling
             topk_vals, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -1082,6 +1087,12 @@ class HuggingFaceBlockLoader(nn.Module):
             lm_head_state = self.model.lm_head.state_dict()
             norm_type = type(self.model.transformer.ln_f).__name__
         
+        # Rotary embeddings'i kaydet (lazy loading için KRİTİK)
+        rotary_emb_state = None
+        if self._rotary_emb is not None:
+            rotary_emb_state = self._rotary_emb.state_dict()
+            print(f"   Rotary embeddings kaydediliyor: {type(self._rotary_emb).__name__}")
+        
         # Router, embedding ve metadata'yı kaydet
         router_path = os.path.join(save_dir, "router.pt")
         torch.save({
@@ -1089,6 +1100,8 @@ class HuggingFaceBlockLoader(nn.Module):
             'embed_state_dict': self.embed_layer.state_dict(),
             'final_norm_state_dict': final_norm_state,
             'lm_head_state_dict': lm_head_state,
+            'rotary_emb_state_dict': rotary_emb_state,
+            'rotary_emb_class': type(self._rotary_emb).__name__ if self._rotary_emb else None,
             'config': {
                 'num_blocks': self.num_blocks,
                 'top_k': self.top_k,
@@ -1098,6 +1111,7 @@ class HuggingFaceBlockLoader(nn.Module):
                 'is_qwen': self._is_qwen,
                 'norm_type': norm_type,
                 'model_class': type(self.model).__name__,
+                'has_rotary_emb': rotary_emb_state is not None,
             }
         }, router_path)
         
@@ -1239,8 +1253,39 @@ class HuggingFaceBlockLoader(nn.Module):
         
         # Model tipi bilgisi (Qwen desteği için)
         loader._is_qwen = config.get('is_qwen', False)
-        loader._rotary_emb = None  # Lazy loading'de rotary emb diskten gelmez
         loader.no_sharding = False  # Lazy loading'de no_sharding kullanılmaz
+        
+        # Rotary embeddings'i diskten yükle (Qwen modelleri için KRİTİK)
+        loader._rotary_emb = None
+        if config.get('has_rotary_emb', False) and router_data.get('rotary_emb_state_dict'):
+            try:
+                from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding
+                # Config'ten rotary_emb parametrelerini oluştur
+                # Qwen2RotaryEmbedding genelde config'ten oluşturulur
+                # Ama diskten yüklerken config yok, state_dict'ten boyutları çıkar
+                rotary_state = router_data['rotary_emb_state_dict']
+                if 'inv_freq' in rotary_state:
+                    inv_freq = rotary_state['inv_freq']
+                    dim = inv_freq.shape[0] * 2  # inv_freq dim/2 boyutunda
+                    rotary_emb = Qwen2RotaryEmbedding(dim=dim)
+                    rotary_emb.load_state_dict(rotary_state, strict=False)
+                    rotary_emb.to(device_obj)
+                    loader._rotary_emb = rotary_emb
+                    print(f"✅ Rotary embeddings diskten yüklendi (Qwen2RotaryEmbedding, dim={dim})")
+                else:
+                    # inv_freq yoksa, yeni transformers — rotary_emb parametresiz çalışır
+                    # Bu durumda Qwen2RotaryEmbedding'i config'siz oluştur
+                    rotary_emb = Qwen2RotaryEmbedding(config=None)
+                    rotary_emb.load_state_dict(rotary_state, strict=False)
+                    rotary_emb.to(device_obj)
+                    loader._rotary_emb = rotary_emb
+                    print(f"✅ Rotary embeddings diskten yüklendi")
+            except Exception as e:
+                print(f"⚠️  Rotary embeddings diskten yüklenemedi: {e}")
+                print(f"   Fallback: position_embeddings hesaplanamayabilir")
+        elif loader._is_qwen:
+            print(f"⚠️  Rotary embeddings disk dosyasında yok — eski format")
+            print(f"   Çözüm: Modeli tekrar save_blocks_to_disk ile kaydedin")
         
         # Blokları lazy yükle (şimdilik boş, gerektiğinde diskten yüklenecek)
         loader.blocks = nn.ModuleList()

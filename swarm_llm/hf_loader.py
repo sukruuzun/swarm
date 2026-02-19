@@ -78,6 +78,7 @@ class HuggingFaceBlockLoader(nn.Module):
         layers_per_block: Optional[int] = None,
         embed_dim: Optional[int] = None,
         device: str = "auto",
+        sticky_duration: int = 25,  # Sticky routing: kaç token boyunca bloklar sabit kalır
     ):
         """
         Args:
@@ -156,6 +157,14 @@ class HuggingFaceBlockLoader(nn.Module):
         
         # Blok kullanım takibi (cleanup için)
         self._block_usage_count = {}  # {block_idx: kullanım_sayısı}
+        
+        # Sticky Routing: Bir kez seçilen bloklar belirli bir süre sabit kalır
+        # Bu sayede her token için router çalıştırmak yerine, bloklar sabitlenir
+        # Örnek: "Tarih" konusu için Blok 2 ve 3 seçildiyse, sonraki 25 token boyunca
+        # aynı bloklar kullanılır (SSD trafiği biter, metin akıcılaşır)
+        self._sticky_blocks = None  # Şu an sabitlenmiş bloklar (set veya None)
+        self._sticky_until_token = 0  # Hangi token'a kadar sabit kalacak
+        self._sticky_duration = sticky_duration  # Kaç token boyunca sabit kalır
 
     def _extract_layers(self) -> nn.ModuleList:
         """
@@ -279,14 +288,17 @@ class HuggingFaceBlockLoader(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         use_cache: bool = False,  # Zorunlu olarak False (KV Cache henüz desteklenmiyor)
+        current_token_idx: Optional[int] = None,  # Sticky routing için: şu anki token indeksi
     ) -> dict:
         """
         Forward pass: Sadece router'ın seçtiği bloklar çalışır.
+        Sticky Routing: Eğer sticky blocks varsa, router'ı atla ve sabitlenmiş blokları kullan.
 
         Args:
             input_ids: (B, L) token ids
             attention_mask: (B, L) attention mask (opsiyonel)
             use_cache: KV cache kullan (opsiyonel, şimdilik False zorunlu)
+            current_token_idx: Şu anki token indeksi (sticky routing için)
 
         Returns:
             logits, hidden_states, selected_indices, router_info
@@ -301,17 +313,37 @@ class HuggingFaceBlockLoader(nn.Module):
         # Embedding
         x = self.embed_layer(input_ids)  # (B, L, D)
 
-        # Router ile blok seçimi
-        probs, indices, aux_loss, weights = self.router(x, pool_input=True)
-        indices = indices.squeeze().cpu().tolist()
-        if isinstance(indices, int):
-            indices = [indices]
+        # STICKY ROUTING: Eğer sticky blocks varsa ve henüz süresi dolmamışsa, router'ı atla
+        if self._sticky_blocks is not None and current_token_idx is not None:
+            if current_token_idx < self._sticky_until_token:
+                # Sticky blocks'u kullan, router'ı çalıştırma
+                selected_indices = list(self._sticky_blocks)
+                # Sticky blocks için dummy weights (router çalışmadığı için)
+                weights = torch.ones(len(selected_indices)) / len(selected_indices)
+                probs = None
+                aux_loss = None
+            else:
+                # Sticky süresi doldu, router'ı tekrar çalıştır ve yeni bloklar seç
+                self._sticky_blocks = None
+                self._sticky_until_token = 0
+                # Router ile blok seçimi
+                probs, indices, aux_loss, weights = self.router(x, pool_input=True)
+                indices = indices.squeeze().cpu().tolist()
+                if isinstance(indices, int):
+                    indices = [indices]
+                selected_indices = indices[: self.top_k]
+        else:
+            # Normal router ile blok seçimi
+            probs, indices, aux_loss, weights = self.router(x, pool_input=True)
+            indices = indices.squeeze().cpu().tolist()
+            if isinstance(indices, int):
+                indices = [indices]
+            selected_indices = indices[: self.top_k]
 
         # Sadece seçilen blokları sıralı çalıştır
         # KRİTİK: HuggingFace katmanları tuple döndürür (hidden_states, past_key_values, ...)
         # Defansif kodlama: Her adımda tuple kontrolü yap, sadece Tensor al
         x_out = x
-        selected_indices = indices[: self.top_k]
         
         for idx in selected_indices:
             # Lazy loading: Eğer blok diskte ise önce yükle
@@ -461,11 +493,25 @@ class HuggingFaceBlockLoader(nn.Module):
         if prefetch_next and self._lazy_load:
             first_indices, _ = self.predict_blocks(prompt, prefetch=True)
 
+        # STICKY ROUTING: İlk prompt için router çalışır ve blokları sabitler
+        # Sonraki N token için (sticky_duration) aynı bloklar kullanılır
+        initial_prompt_len = generated.shape[1]
+        
         for step in range(max_new_tokens):
+            current_token_idx = initial_prompt_len + step
+            
             # KRİTİK: Her adımda TÜM bağlamı forward'a gönder (KV Cache olmadığı için)
             # generated tüm token'ları içeriyor: [prompt + generated_tokens]
             # use_cache=False olduğu için her adımda tüm bağlamı yeniden işliyoruz
-            outputs = self.forward(generated, use_cache=False)
+            # Sticky routing: current_token_idx ile sticky blocks kontrolü yapılır
+            outputs = self.forward(generated, use_cache=False, current_token_idx=current_token_idx)
+            
+            # Eğer sticky blocks yoksa veya süresi dolduysa, yeni blokları sabitle
+            if self._sticky_blocks is None:
+                selected_indices = outputs["selected_indices"]
+                self._sticky_blocks = set(selected_indices)
+                self._sticky_until_token = current_token_idx + self._sticky_duration
+                print(f"🔒 Sticky Routing: Bloklar {self._sticky_blocks} sabitlendi (token {current_token_idx}-{self._sticky_until_token})")
             
             # Son token'ın logits'ini al (tüm bağlam üzerinden)
             logits = outputs["logits"][:, -1, :] / temperature
@@ -479,13 +525,21 @@ class HuggingFaceBlockLoader(nn.Module):
             # Yeni token'ı bağlama ekle (bir sonraki adım için)
             generated = torch.cat([generated, next_token], dim=1)
 
-            # Bir sonraki adımın bloklarını prefetch et (asenkron)
+            # Prefetching: Sticky routing aktifken prefetch'e gerek yok
+            # (Bloklar zaten sabitlenmiş ve RAM'de)
             if prefetch_next and self._lazy_load and step < max_new_tokens - 1:
-                # Son token'a bakarak bir sonraki adımın bloklarını tahmin et
-                next_prompt = self.tokenizer.decode(generated[0].tolist(), skip_special_tokens=True)
-                next_indices, _ = self.predict_blocks(next_prompt, prefetch=True)
+                # Sadece sticky süresi dolmak üzereyse bir sonraki adımın bloklarını tahmin et
+                if current_token_idx >= self._sticky_until_token - 5:  # 5 token önceden tahmin et
+                    next_prompt = self.tokenizer.decode(generated[0].tolist(), skip_special_tokens=True)
+                    next_indices, _ = self.predict_blocks(next_prompt, prefetch=True)
 
-        return self.tokenizer.decode(generated[0].tolist(), skip_special_tokens=True)
+        result = self.tokenizer.decode(generated[0].tolist(), skip_special_tokens=True)
+        
+        # Sticky blocks'u temizle (bir sonraki generate için)
+        self._sticky_blocks = None
+        self._sticky_until_token = 0
+        
+        return result
 
     def estimate_vram_savings(self) -> dict:
         """
@@ -580,6 +634,7 @@ class HuggingFaceBlockLoader(nn.Module):
         save_dir: str,
         device: str = "auto",
         lazy_load: bool = True,
+        sticky_duration: int = 25,  # Sticky routing: kaç token boyunca bloklar sabit kalır
     ):
         """
         Diskten blokları yükleyerek loader oluştur (Lazy Loading).
@@ -689,6 +744,11 @@ class HuggingFaceBlockLoader(nn.Module):
         
         # Blok kullanım takibi (cleanup için)
         loader._block_usage_count = {}  # {block_idx: kullanım_sayısı}
+        
+        # Sticky Routing: Bir kez seçilen bloklar belirli bir süre sabit kalır
+        loader._sticky_blocks = None
+        loader._sticky_until_token = 0
+        loader._sticky_duration = sticky_duration  # Kaç token boyunca sabit kalır
         
         # Asenkron prefetching için
         loader._prefetch_queue = Queue()

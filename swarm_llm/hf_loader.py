@@ -750,68 +750,55 @@ class HuggingFaceBlockLoader(nn.Module):
                 indices = [indices]
             selected_indices = indices[: self.top_k]
 
-        # Sadece seçilen blokları sıralı çalıştır
-        # KRİTİK: Transformer katmanları sıralı — blokları indeks sırasına göre çalıştır!
-        # Aksi halde Block 5 → Block 2 çalışır ki bu yanlıştır
+        # TÜM blokları sırayla çalıştır:
+        # - Seçilen bloklar: Full hesaplama (VRAM kullanır)
+        # - Seçilmeyen bloklar: Identity/residual geçiş (sıfır VRAM, sıfır hesaplama)
+        # Bu sayede transformer'ın residual stream'i kesintisiz devam eder.
+        # Layer dropping mantığı: output = input (bloğun katkısı atlanır, ama akış kopmaz)
         x_out = x
+        selected_set = set(selected_indices)
         
-        for idx in sorted(selected_indices):
-            # Lazy loading: Eğer blok diskte ise önce yükle
-            if self._lazy_load:
-                # Prefetch cache'inde var mı kontrol et
-                with self._prefetch_lock:
-                    if idx in self._loaded_blocks:
-                        block = self._loaded_blocks[idx]
-                    else:
-                        # Prefetch henüz tamamlanmamış, şimdi yükle
-                        block = self._load_block_from_disk(idx)
-            else:
-                block = self.blocks[idx]
-            
-            # Blok çıktısını al
-            # Not: Accelerate ile dağıtılmış modellerde blok farklı cihazda olabilir
-            # PyTorch otomatik olarak doğru cihaza yönlendirir
-            
-            # KRİTİK: Qwen2 gibi modeller position_embeddings bekler
-            # QwenBlockWrapper position_embeddings'i kabul eder
-            if isinstance(block, QwenBlockWrapper) and position_embeddings is not None:
-                block_out = block(x_out, position_embeddings=position_embeddings, 
-                                 position_ids=position_ids, 
-                                 attention_mask=attention_mask)
-            else:
-                # Normal Sequential veya diğer modeller için
-                block_out = block(x_out)
-            
-            # DEFANSİF KODLAMA: Tuple kontrolü (HuggingFace standardı)
-            # HuggingFace modelleri genelde (hidden_states, past_key_values, ...) döndürür
-            if isinstance(block_out, tuple):
-                # Tuple ise sadece 0. indeksi al (hidden_states)
-                x_out = block_out[0]
-            # BaseModelOutput veya benzeri objeler için
-            elif hasattr(block_out, 'last_hidden_state'):
-                x_out = block_out.last_hidden_state
-            elif hasattr(block_out, 'hidden_states') and block_out.hidden_states:
-                x_out = block_out.hidden_states[-1]
-            # Tensor ise direkt kullan
-            elif isinstance(block_out, torch.Tensor):
-                x_out = block_out
-            else:
-                # Son çare: ilk elemanı dene
-                try:
-                    if hasattr(block_out, '__getitem__'):
-                        x_out = block_out[0]
-                    else:
-                        x_out = block_out
-                except:
+        for idx in range(self.num_blocks):
+            if idx in selected_set:
+                # ── SEÇİLEN BLOK: Full hesaplama ──
+                if self._lazy_load:
+                    with self._prefetch_lock:
+                        if idx in self._loaded_blocks:
+                            block = self._loaded_blocks[idx]
+                        else:
+                            block = self._load_block_from_disk(idx)
+                else:
+                    block = self.blocks[idx]
+                
+                if isinstance(block, QwenBlockWrapper) and position_embeddings is not None:
+                    block_out = block(x_out, position_embeddings=position_embeddings, 
+                                     position_ids=position_ids, 
+                                     attention_mask=attention_mask)
+                else:
+                    block_out = block(x_out)
+                
+                # DEFANSİF KODLAMA: Tuple kontrolü
+                if isinstance(block_out, tuple):
+                    x_out = block_out[0]
+                elif hasattr(block_out, 'last_hidden_state'):
+                    x_out = block_out.last_hidden_state
+                elif isinstance(block_out, torch.Tensor):
                     x_out = block_out
-            
-            # ÇİFT KONTROL: x_out hala tuple/list ise (iç içe tuple durumu)
-            while isinstance(x_out, (tuple, list)) and len(x_out) > 0:
-                x_out = x_out[0]
-            
-            # Final güvenlik: Tensor olduğundan emin ol
-            if not isinstance(x_out, torch.Tensor):
-                raise TypeError(f"Blok {idx} çıktısı Tensor değil: {type(x_out)}")
+                else:
+                    try:
+                        x_out = block_out[0] if hasattr(block_out, '__getitem__') else block_out
+                    except Exception:
+                        x_out = block_out
+                
+                while isinstance(x_out, (tuple, list)) and len(x_out) > 0:
+                    x_out = x_out[0]
+                
+                if not isinstance(x_out, torch.Tensor):
+                    raise TypeError(f"Blok {idx} çıktısı Tensor değil: {type(x_out)}")
+            else:
+                # ── SEÇİLMEYEN BLOK: Identity (residual geçiş) ──
+                # x_out = x_out  →  Bloğun katkısı atlanır ama akış kopmaz
+                pass
 
         # Final norm'dan önce tuple kontrolü
         if isinstance(x_out, tuple):
@@ -1337,12 +1324,16 @@ class HuggingFaceBlockLoader(nn.Module):
         
         for combo in all_combos:
             total_kl = 0.0
+            combo_set = set(combo)
             for x_embed, t_logits in teacher_data:
                 with torch.no_grad():
                     x_running = x_embed.clone()
-                    for bi in sorted(combo):
-                        block = self._load_block_from_disk(bi) if self._lazy_load else self.blocks[bi]
-                        x_running = self._run_single_block(block, x_running)
+                    # Forward ile aynı mantık: seçilen → full, diğer → identity
+                    for bi in range(self.num_blocks):
+                        if bi in combo_set:
+                            block = self._load_block_from_disk(bi) if self._lazy_load else self.blocks[bi]
+                            x_running = self._run_single_block(block, x_running)
+                        # else: identity (pass)
                     s_logits = self._get_logits(x_running)
                     t_p = torch.nn.functional.softmax(t_logits.float(), dim=-1)
                     s_lp = torch.nn.functional.log_softmax(s_logits.float(), dim=-1)

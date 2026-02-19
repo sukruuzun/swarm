@@ -1518,23 +1518,31 @@ class HuggingFaceBlockLoader(nn.Module):
         return out[0] if isinstance(out, tuple) else out
     
     def _get_logits(self, hidden_states):
-        """Hidden states'ten logits hesapla (final_norm + lm_head)."""
-        # Final norm
+        """Hidden states'ten logits hesapla (final_norm + lm_head).
+        
+        KRİTİK: accelerate hook temizlendikten sonra norm/lm_head CPU'da
+        kalabilir. hidden_states'in device'ına taşıyoruz.
+        """
+        target_device = hidden_states.device
+        
         if self.model is not None:
             if hasattr(self.model, "model") and hasattr(self.model.model, "norm"):
-                x = self.model.model.norm(hidden_states)
+                norm = self.model.model.norm.to(target_device)
+                x = norm(hidden_states)
             else:
                 x = hidden_states
-            # LM head
             if hasattr(self.model, "lm_head"):
-                return self.model.lm_head(x)
+                lm_head = self.model.lm_head.to(target_device)
+                return lm_head(x)
         else:
             # Lazy loading
             if self._final_norm is not None:
+                self._final_norm = self._final_norm.to(target_device)
                 x = self._final_norm(hidden_states)
             else:
                 x = hidden_states
             if self._lm_head is not None:
+                self._lm_head = self._lm_head.to(target_device)
                 return self._lm_head(x)
         return None
 

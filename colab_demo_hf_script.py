@@ -176,28 +176,61 @@ def run_sharded_demo(model, tokenizer, num_blocks: int, top_k: int, prompt: str,
     if save_dir:
         print(f"\n💾 Bloklar diske kaydediliyor: {save_dir}")
         loader.save_blocks_to_disk(save_dir)
+        
+        # ── HEMEN DRIVE'A KOPYALA (kalibrasyon çökmeden önce!) ──
+        try:
+            from google.colab import drive
+            import shutil
+            print(f"\n📁 Google Drive'a kopyalanıyor...")
+            drive.mount('/content/drive', force_remount=False)
+            drive_target = f"/content/drive/MyDrive/swarm_model_blocks"
+            os.makedirs(drive_target, exist_ok=True)
+            
+            files_copied = 0
+            total_size_mb = 0
+            for fname in sorted(os.listdir(save_dir)):
+                if fname.endswith('.pt'):
+                    src = os.path.join(save_dir, fname)
+                    dst = os.path.join(drive_target, fname)
+                    fsize_mb = os.path.getsize(src) / (1024**2)
+                    print(f"   📄 {fname} ({fsize_mb:.1f} MB) → Drive")
+                    shutil.copy2(src, dst)
+                    files_copied += 1
+                    total_size_mb += fsize_mb
+            
+            print(f"\n✅ {files_copied} dosya Drive'a kopyalandı!")
+            print(f"   📍 My Drive/swarm_model_blocks/")
+            print(f"   📦 Toplam: {total_size_mb:.0f} MB ({total_size_mb/1024:.1f} GB)")
+        except ImportError:
+            print("ℹ️  Colab değil, Drive kopyalama atlandı.")
+        except Exception as e:
+            print(f"⚠️  Drive kopyalama hatası: {e}")
     
-    # Router kalibrasyonu
-    print(f"\n🎓 Router kalibrasyonu başlıyor...")
-    loader.calibrate_router(num_steps=200)
+    # Router kalibrasyonu (opsiyonel — T4'te cihaz sorunu olabilir)
+    try:
+        print(f"\n🎓 Router kalibrasyonu başlıyor...")
+        loader.calibrate_router(num_steps=200)
+        
+        block_indices2, weights2 = loader.predict_blocks(prompt, prefetch=False)
+        print(f"🔮 Kalibre edilmiş blok tahmini:")
+        print(f"   Tahmin edilen bloklar: {block_indices2}")
+        print(f"   Ağırlıklar: {[f'{w:.2%}' for w in weights2.tolist()]}")
+    except Exception as e:
+        print(f"⚠️  Kalibrasyon hatası (bloklar yine de kaydedildi): {e}")
     
-    # Kalibre edilmiş router ile blok tahmini
-    block_indices2, weights2 = loader.predict_blocks(prompt, prefetch=False)
-    print(f"🔮 Kalibre edilmiş blok tahmini:")
-    print(f"   Tahmin edilen bloklar: {block_indices2}")
-    print(f"   Ağırlıklar: {[f'{w:.2%}' for w in weights2.tolist()]}")
-    
-    # Metin üretimi (kalibre edilmiş router ile)
-    print(f"\n🔄 Metin üretimi başlıyor (kalibre edilmiş sharding modu)...")
-    generated = loader.generate(
-        prompt=prompt,
-        max_new_tokens=100,
-        temperature=0.8,
-        top_k=40,
-    )
-    
-    print(f"\n📝 Üretilen metin:")
-    print(f"'{generated}'")
+    # Metin üretimi
+    try:
+        print(f"\n🔄 Metin üretimi başlıyor (sharding modu)...")
+        generated = loader.generate(
+            prompt=prompt,
+            max_new_tokens=100,
+            temperature=0.8,
+            top_k=40,
+        )
+        print(f"\n📝 Üretilen metin:")
+        print(f"'{generated}'")
+    except Exception as e:
+        print(f"⚠️  Metin üretimi hatası: {e}")
     
     return loader
 
@@ -307,47 +340,6 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     print(f"\n✅ Model RAM'den kaldırıldı")
-    
-    # ══════════════════════════════════════════════════════════════
-    # 📁 GOOGLE DRIVE'A KAYDET (PC'ye indirmek için)
-    # ══════════════════════════════════════════════════════════════
-    try:
-        from google.colab import drive
-        print(f"\n{'='*70}")
-        print(f"📁 GOOGLE DRIVE'A KOPYALANIYOR")
-        print(f"{'='*70}")
-        drive.mount('/content/drive', force_remount=False)
-        
-        import shutil
-        drive_target = f"/content/drive/MyDrive/{args.drive_dir}"
-        os.makedirs(drive_target, exist_ok=True)
-        
-        # Tüm blok dosyalarını kopyala
-        save_dir = args.save_dir
-        files_copied = 0
-        total_size_mb = 0
-        for fname in sorted(os.listdir(save_dir)):
-            if fname.endswith('.pt'):
-                src = os.path.join(save_dir, fname)
-                dst = os.path.join(drive_target, fname)
-                fsize_mb = os.path.getsize(src) / (1024**2)
-                print(f"   📄 {fname} ({fsize_mb:.1f} MB) → Drive")
-                shutil.copy2(src, dst)
-                files_copied += 1
-                total_size_mb += fsize_mb
-        
-        print(f"\n✅ {files_copied} dosya Google Drive'a kopyalandı!")
-        print(f"   📍 Konum: My Drive/{args.drive_dir}/")
-        print(f"   📦 Toplam: {total_size_mb:.0f} MB ({total_size_mb/1024:.1f} GB)")
-        print(f"\n💡 PC'ye İndirme:")
-        print(f"   1. drive.google.com → '{args.drive_dir}' klasörü")
-        print(f"   2. Tüm .pt dosyalarını indir")
-        print(f"   3. Kendi PC'de: python colab_demo_hf_script.py --skip-lazy")
-    except ImportError:
-        print("\nℹ️  Google Drive mevcut değil (yerel makine). --save-dir'e kaydedildi.")
-    except Exception as e:
-        print(f"\n⚠️  Drive kaydetme hatası: {e}")
-        print(f"   Bloklar yine de {args.save_dir}/ dizininde mevcut.")
     
     # 4. Lazy loading
     if not args.skip_lazy:

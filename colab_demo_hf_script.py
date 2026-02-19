@@ -263,6 +263,8 @@ def main():
                        help="Test prompt'u")
     parser.add_argument("--save-dir", type=str, default="model_blocks_qwen25_7b",
                        help="Blokların kaydedileceği dizin")
+    parser.add_argument("--drive-dir", type=str, default="swarm_model_blocks",
+                       help="Google Drive'daki hedef klasör adı")
     parser.add_argument("--test-only", action="store_true",
                        help="Sadece NO-SHARDING testi çalıştır")
     parser.add_argument("--skip-lazy", action="store_true",
@@ -306,6 +308,47 @@ def main():
         torch.cuda.empty_cache()
     print(f"\n✅ Model RAM'den kaldırıldı")
     
+    # ══════════════════════════════════════════════════════════════
+    # 📁 GOOGLE DRIVE'A KAYDET (PC'ye indirmek için)
+    # ══════════════════════════════════════════════════════════════
+    try:
+        from google.colab import drive
+        print(f"\n{'='*70}")
+        print(f"📁 GOOGLE DRIVE'A KOPYALANIYOR")
+        print(f"{'='*70}")
+        drive.mount('/content/drive', force_remount=False)
+        
+        import shutil
+        drive_target = f"/content/drive/MyDrive/{args.drive_dir}"
+        os.makedirs(drive_target, exist_ok=True)
+        
+        # Tüm blok dosyalarını kopyala
+        save_dir = args.save_dir
+        files_copied = 0
+        total_size_mb = 0
+        for fname in sorted(os.listdir(save_dir)):
+            if fname.endswith('.pt'):
+                src = os.path.join(save_dir, fname)
+                dst = os.path.join(drive_target, fname)
+                fsize_mb = os.path.getsize(src) / (1024**2)
+                print(f"   📄 {fname} ({fsize_mb:.1f} MB) → Drive")
+                shutil.copy2(src, dst)
+                files_copied += 1
+                total_size_mb += fsize_mb
+        
+        print(f"\n✅ {files_copied} dosya Google Drive'a kopyalandı!")
+        print(f"   📍 Konum: My Drive/{args.drive_dir}/")
+        print(f"   📦 Toplam: {total_size_mb:.0f} MB ({total_size_mb/1024:.1f} GB)")
+        print(f"\n💡 PC'ye İndirme:")
+        print(f"   1. drive.google.com → '{args.drive_dir}' klasörü")
+        print(f"   2. Tüm .pt dosyalarını indir")
+        print(f"   3. Kendi PC'de: python colab_demo_hf_script.py --skip-lazy")
+    except ImportError:
+        print("\nℹ️  Google Drive mevcut değil (yerel makine). --save-dir'e kaydedildi.")
+    except Exception as e:
+        print(f"\n⚠️  Drive kaydetme hatası: {e}")
+        print(f"   Bloklar yine de {args.save_dir}/ dizininde mevcut.")
+    
     # 4. Lazy loading
     if not args.skip_lazy:
         run_lazy_loading_demo(tokenizer, args.save_dir, args.prompt)
@@ -319,6 +362,7 @@ def main():
     print("✅ Sticky Routing: Thrashing önlendi")
     print("✅ Lazy Loading: Bloklar diskten gerektiğinde yüklendi")
     print("✅ Vocab Alignment: Otomatik kontrol yapıldı")
+    print("✅ Accelerate hook temizleme: T4 uyumluluğu")
 
 
 if __name__ == "__main__":

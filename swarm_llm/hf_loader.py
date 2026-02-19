@@ -994,11 +994,38 @@ class HuggingFaceBlockLoader(nn.Module):
         Modeli bloklara ayırıp diske kaydet (Sharding).
         Her blok ayrı bir dosya olarak kaydedilir: block_0.pt, block_1.pt, ...
         
+        KRİTİK: accelerate kütüphanesi düşük VRAM'de model dispatch ederken
+        modüllere hook (kanca) takar. Bu hook'lar torch.save'i bozar.
+        Kaydetmeden önce hook'lar temizlenir.
+        
         Args:
             save_dir: Blokların kaydedileceği dizin
         """
         import os
         os.makedirs(save_dir, exist_ok=True)
+        
+        # ── HOOK TEMİZLEME (accelerate uyumluluğu) ──
+        # T4 gibi düşük VRAM GPU'larda accelerate hook takar
+        # Bu hook'lar pickle/torch.save'i bozar
+        try:
+            from accelerate.hooks import remove_hook_from_module
+            hook_cleaned = 0
+            for block in self.blocks:
+                remove_hook_from_module(block, recurse=True)
+                hook_cleaned += 1
+            # Model seviyesinde de temizle
+            if self.model is not None:
+                remove_hook_from_module(self.model, recurse=True)
+            if self._rotary_emb is not None:
+                try:
+                    remove_hook_from_module(self._rotary_emb, recurse=True)
+                except Exception:
+                    pass
+            print(f"🧹 Accelerate hook'ları temizlendi ({hook_cleaned} blok)")
+        except ImportError:
+            print("ℹ️  accelerate yüklü değil, hook temizleme atlandı")
+        except Exception as e:
+            print(f"⚠️  Hook temizleme uyarısı: {e}")
         
         print(f"💾 Model blokları diske kaydediliyor: {save_dir}")
         
@@ -1008,7 +1035,6 @@ class HuggingFaceBlockLoader(nn.Module):
             # KRİTİK: Tam modülü kaydet (state_dict DEĞİL!)
             # state_dict sadece sayıları kaydeder, modül yapısını kaybeder
             # torch.save(module) ise gerçek Qwen2DecoderLayer'ları korur
-            # Böylece diskten yüklenince forward pass gerçek hesaplama yapar
             block_cpu = block.cpu()
             torch.save(block_cpu, block_path)
             block.to(self.device)  # Geri GPU'ya taşı (sharding modu için)
